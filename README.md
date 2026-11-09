@@ -16,6 +16,14 @@ A program can have a Haiku version (in its project's own recipe and
 `haiku-packages`) and a Renga version (here) at the same time. The two are
 kept apart so that neither build is mixed into the other's repository.
 
+## Porting a program
+
+Start with [docs/PORTING-TO-RENGA.md](docs/PORTING-TO-RENGA.md): deciding between a Haiku and a Renga
+port, using Renga's APIs, native integration, building, testing and
+packaging. The API reference is
+[PORTING.md](https://github.com/Techniix/haiku/blob/ce/main/3rdparty/ce/PORTING.md)
+in the Renga tree.
+
 ## Layout
 
 ```
