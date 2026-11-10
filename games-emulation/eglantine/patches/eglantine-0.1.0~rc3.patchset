@@ -1,0 +1,691 @@
+From 1435697de348c67be10125f4896bca1c8d927c4b Mon Sep 17 00:00:00 2001
+From: Techniix <Techniix@users.noreply.github.com>
+Date: Mon, 9 Nov 2026 15:49:40 -0500
+Subject: [PATCH 1/5] common: use memfd_create for host memory where the build
+ finds it
+
+On Haiku, guest memory was backed by a POSIX shared memory object with
+a made-up name (shm_open_anon), which can collide and has to be
+unlinked again. Renga, a Haiku-based system, has memfd_create() in
+libgnu, with its header in Haiku's "gnu" header directory. Look for it
+at configure time and use it when it is there; stock Haiku keeps the
+shm_open path.
+
+Also close the backing descriptor before forgetting it when falling
+back to private mappings: the old code set fd to -1 first and then
+closed -1, leaking the descriptor.
+
+Assisted-by: Claude Opus 5.5 (draft; not yet built or run)
+---
+ src/common/CMakeLists.txt  | 23 +++++++++++++++++++++++
+ src/common/host_memory.cpp | 10 +++++++---
+ 2 files changed, 30 insertions(+), 3 deletions(-)
+
+diff --git a/src/common/CMakeLists.txt b/src/common/CMakeLists.txt
+index dcd78ac..70bbac7 100644
+--- a/src/common/CMakeLists.txt
++++ b/src/common/CMakeLists.txt
+@@ -263,4 +263,27 @@ if(ANDROID)
+     target_link_libraries(common PRIVATE android)
+ endif()
+ 
++# Haiku keeps Linux-style interfaces in libgnu, with their headers in a
++# separate "gnu" directory that wraps the POSIX ones (#include_next), so the
++# directory has to come first on the include path. Some Haiku-based systems
++# (Renga) provide memfd_create() there; stock Haiku does not, and keeps using
++# the shm_open() fallback in host_memory.cpp.
++if (HAIKUOS)
++    find_path(HAIKU_GNU_INCLUDE_DIR sys/mman.h
++        PATHS "${CMAKE_SYSROOT}/boot/system/develop/headers/gnu" NO_DEFAULT_PATH)
++    if (HAIKU_GNU_INCLUDE_DIR)
++        include(CheckSymbolExists)
++        set(CMAKE_REQUIRED_INCLUDES "${HAIKU_GNU_INCLUDE_DIR}")
++        set(CMAKE_REQUIRED_LIBRARIES gnu)
++        check_symbol_exists(memfd_create "sys/mman.h" HAVE_MEMFD_CREATE)
++        unset(CMAKE_REQUIRED_INCLUDES)
++        unset(CMAKE_REQUIRED_LIBRARIES)
++        if (HAVE_MEMFD_CREATE)
++            target_include_directories(common BEFORE PRIVATE "${HAIKU_GNU_INCLUDE_DIR}")
++            target_compile_definitions(common PRIVATE HAVE_MEMFD_CREATE)
++            target_link_libraries(common PRIVATE gnu)
++        endif()
++    endif()
++endif()
++
+ create_target_directory_groups(common)
+diff --git a/src/common/host_memory.cpp b/src/common/host_memory.cpp
+index 2ef1982..b60af6a 100644
+--- a/src/common/host_memory.cpp
++++ b/src/common/host_memory.cpp
+@@ -465,7 +465,8 @@ static void* ChooseVirtualBase(size_t virtual_size) {
+ 
+ #endif
+ 
+-#if defined(__sun__) || defined(__HAIKU__) || defined(__NetBSD__) || defined(__DragonFly__)
++#if (defined(__sun__) || defined(__HAIKU__) || defined(__NetBSD__) || defined(__DragonFly__)) && \
++    !defined(HAVE_MEMFD_CREATE)
+ /// Most Unices don't have a portable shm_open (AIX, OpenBSD, NetBSD, Solaris 11, OpenIndiana)
+ /// Portable implementation of shm_open(SHM_ANON, ...) - roughly equivalent but without
+ /// OS support - may fail sporadically, beware!
+@@ -531,7 +532,10 @@ public:
+         long page_size = sysconf(_SC_PAGESIZE);
+         ASSERT_MSG(page_size == 0x1000, "page size {:#x} is incompatible with 4K paging", page_size);
+         // Backing memory initialization
+-#if defined(__sun__) || defined(__HAIKU__) || defined(__NetBSD__) || defined(__DragonFly__)
++#if defined(HAVE_MEMFD_CREATE)
++        // Detected at configure time, for systems that are not Linux but have it (Renga)
++        fd = memfd_create("HostMemory", MFD_CLOEXEC);
++#elif defined(__sun__) || defined(__HAIKU__) || defined(__NetBSD__) || defined(__DragonFly__)
+         fd = shm_open_anon(O_RDWR | O_CREAT | O_EXCL | O_NOFOLLOW, 0600);
+ #elif defined(__OpenBSD__)
+         fd = shm_open_anon(O_RDWR | O_CREAT | O_EXCL | O_NOFOLLOW, 0600);
+@@ -564,8 +568,8 @@ public:
+             LOG_WARNING(Common_Memory, "Using private mappings instead of shared ones");
+             backing_base = static_cast<u8*>(mmap(nullptr, backing_size, PROT_READ | PROT_WRITE, MAP_ANONYMOUS | MAP_PRIVATE | MAP_NOCORE, -1, 0));
+             if (fd > 0) {
+-                fd = -1;
+                 close(fd);
++                fd = -1;
+             }
+         } else {
+             backing_base = static_cast<u8*>(mmap(nullptr, backing_size, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_NOCORE, fd, 0));
+-- 
+2.43.0
+
+
+From b89a4bc3237808f2b9d7fcb414267ca2475c335a Mon Sep 17 00:00:00 2001
+From: Techniix <Techniix@users.noreply.github.com>
+Date: Mon, 9 Nov 2026 15:50:17 -0500
+Subject: [PATCH 2/5] dynarmic: enable fastmem on Haiku
+
+Haiku was built with the generic exception handler, so every guest
+memory access went through the slow path: the build excluded the POSIX
+handler because Haiku has no <ucontext.h>. The handler does not need
+that header there. Haiku passes a ucontext_t, declared in <signal.h>,
+to SA_SIGINFO handlers, and its kernel restores rip and rsp from
+uc_mcontext (struct vregs) when the handler returns
+(arch_restore_signal_frame), which is all the fastmem fault path uses.
+
+Build the POSIX handler on Haiku and add the register names for
+x86_64. This works on stock Haiku as well as on Renga.
+
+Assisted-by: Claude Opus 5.5 (draft; not yet built or run)
+---
+ src/dynarmic/src/dynarmic/CMakeLists.txt   | 3 +--
+ src/dynarmic/src/dynarmic/common/context.h | 9 ++++++++-
+ 2 files changed, 9 insertions(+), 3 deletions(-)
+
+diff --git a/src/dynarmic/src/dynarmic/CMakeLists.txt b/src/dynarmic/src/dynarmic/CMakeLists.txt
+index cc1cbcb..143a0d2 100644
+--- a/src/dynarmic/src/dynarmic/CMakeLists.txt
++++ b/src/dynarmic/src/dynarmic/CMakeLists.txt
+@@ -363,8 +363,7 @@ elseif (APPLE)
+             backend/exception_handler_macos_mig.c
+         )
+     endif()
+-elseif (UNIX AND NOT HAIKUOS)
+-    # Haiku lacks <ucontext.h>
++elseif (UNIX)
+     if (CMAKE_SYSTEM_NAME STREQUAL "Linux")
+         target_link_libraries(dynarmic PRIVATE rt)
+     endif()
+diff --git a/src/dynarmic/src/dynarmic/common/context.h b/src/dynarmic/src/dynarmic/common/context.h
+index 0c18807..e565cfe 100644
+--- a/src/dynarmic/src/dynarmic/common/context.h
++++ b/src/dynarmic/src/dynarmic/common/context.h
+@@ -8,7 +8,9 @@
+ #    include <sys/ucontext.h>
+ #else
+ #    include <signal.h>
+-#    ifndef __OpenBSD__
++// Haiku declares ucontext_t in <signal.h>; <ucontext.h> only exists on newer
++// Haiku-based systems (Renga) and adds nothing the signal handler needs.
++#    if !defined(__OpenBSD__) && !defined(__HAIKU__)
+ #        include <ucontext.h>
+ #    endif
+ #    ifdef __sun__
+@@ -131,6 +133,11 @@
+ #    elif defined(__managarm__)
+ #        define CTX_PC (mctx.__pollution(gregs)[REG_RIP])
+ #        define CTX_SP (mctx.__pollution(gregs)[REG_RSP])
++#    elif defined(__HAIKU__)
++// mcontext_t is struct vregs (headers/posix/arch/x86_64/signal.h); the kernel
++// restores rip and rsp from it when the handler returns.
++#        define CTX_PC (mctx.rip)
++#        define CTX_SP (mctx.rsp)
+ #    else
+ #        error "unknown platform"
+ #    endif
+-- 
+2.43.0
+
+
+From a00e12070563db07af67d5608056cdc03f37b760 Mon Sep 17 00:00:00 2001
+From: Techniix <Techniix@users.noreply.github.com>
+Date: Mon, 9 Nov 2026 15:53:35 -0500
+Subject: [PATCH 3/5] video_core: present Vulkan on Haiku through the
+ VideoStreamsWsi layer
+
+The Haiku Qt platform was mapped to an XCB surface, which no Haiku
+Vulkan driver provides. Haiku's hardware Vulkan drivers (NVK from
+nvidia-haiku, RADV) present through X547's VideoStreamsWsi, an
+implicit layer implementing VK_EXT_headless_surface and
+VK_KHR_swapchain; the application gives the surface a bitmap hook and
+the layer hands it every presented image as a BBitmap.
+
+Add a Haiku window system type, enable VK_EXT_headless_surface for
+it, and create the surface in vulkan_surface_haiku.cpp, which checks
+that the layer is loaded before using its surface object and draws
+each image into the render window's view. Window locks have a short
+timeout so a busy window thread drops a frame instead of stalling the
+presenter.
+
+Assisted-by: Claude Opus 5.5 (draft; syntax-checked against Haiku headers, not yet built or run)
+---
+ src/core/frontend/emu_window.h                |   1 +
+ src/qt_common/qt_common.cpp                   |   2 +-
+ src/video_core/CMakeLists.txt                 |   8 +
+ src/video_core/vulkan_common/vulkan.h         |   2 +-
+ .../vulkan_common/vulkan_instance.cpp         |   4 +-
+ .../vulkan_common/vulkan_surface.cpp          |  19 +-
+ .../vulkan_common/vulkan_surface_haiku.cpp    | 196 ++++++++++++++++++
+ .../vulkan_common/vulkan_surface_haiku.h      |  15 ++
+ 8 files changed, 230 insertions(+), 17 deletions(-)
+ create mode 100644 src/video_core/vulkan_common/vulkan_surface_haiku.cpp
+ create mode 100644 src/video_core/vulkan_common/vulkan_surface_haiku.h
+
+diff --git a/src/core/frontend/emu_window.h b/src/core/frontend/emu_window.h
+index ee7a769..df40d61 100644
+--- a/src/core/frontend/emu_window.h
++++ b/src/core/frontend/emu_window.h
+@@ -26,6 +26,7 @@ enum class WindowSystemType {
+     Cocoa,
+     Android,
+     Xcb,
++    Haiku,
+ };
+ 
+ /**
+diff --git a/src/qt_common/qt_common.cpp b/src/qt_common/qt_common.cpp
+index 7ad7a47..36c40c5 100644
+--- a/src/qt_common/qt_common.cpp
++++ b/src/qt_common/qt_common.cpp
+@@ -77,7 +77,7 @@ Core::Frontend::WindowSystemType GetWindowSystemType() {
+     else if (platform_name == QStringLiteral("android"))
+         return Core::Frontend::WindowSystemType::Android;
+     else if (platform_name == QStringLiteral("haiku"))
+-        return Core::Frontend::WindowSystemType::Xcb;
++        return Core::Frontend::WindowSystemType::Haiku;
+ 
+     LOG_CRITICAL(Frontend, "Unknown Qt platform {}!", platform_name.toStdString());
+     return Core::Frontend::WindowSystemType::Windows;
+diff --git a/src/video_core/CMakeLists.txt b/src/video_core/CMakeLists.txt
+index c064880..d8d32a3 100644
+--- a/src/video_core/CMakeLists.txt
++++ b/src/video_core/CMakeLists.txt
+@@ -456,6 +456,14 @@ target_link_libraries(video_core PRIVATE sirit::sirit)
+ # Header-only stuff needed by all dependent targets
+ target_link_libraries(video_core PUBLIC Vulkan::Headers Vulkan::UtilityHeaders GPUOpen::VulkanMemoryAllocator)
+ 
++if (HAIKUOS)
++    target_sources(video_core PRIVATE
++        vulkan_common/vulkan_surface_haiku.cpp
++        vulkan_common/vulkan_surface_haiku.h
++    )
++    target_link_libraries(video_core PRIVATE be)
++endif()
++
+ if (ENABLE_NSIGHT_AFTERMATH)
+     if (NOT DEFINED ENV{NSIGHT_AFTERMATH_SDK})
+         message(FATAL_ERROR "Environment variable NSIGHT_AFTERMATH_SDK has to be provided")
+diff --git a/src/video_core/vulkan_common/vulkan.h b/src/video_core/vulkan_common/vulkan.h
+index 2609e8d..6839506 100644
+--- a/src/video_core/vulkan_common/vulkan.h
++++ b/src/video_core/vulkan_common/vulkan.h
+@@ -14,7 +14,7 @@
+ #elif defined(__ANDROID__)
+ #define VK_USE_PLATFORM_ANDROID_KHR
+ #elif defined(__HAIKU__)
+-#define VK_USE_PLATFORM_XCB_KHR
++// Presentation goes through VK_EXT_headless_surface (vulkan_surface_haiku.cpp)
+ #else
+ #define VK_USE_PLATFORM_XLIB_KHR
+ #define VK_USE_PLATFORM_WAYLAND_KHR
+diff --git a/src/video_core/vulkan_common/vulkan_instance.cpp b/src/video_core/vulkan_common/vulkan_instance.cpp
+index 3ab924e..c5ac526 100644
+--- a/src/video_core/vulkan_common/vulkan_instance.cpp
++++ b/src/video_core/vulkan_common/vulkan_instance.cpp
+@@ -61,8 +61,8 @@ namespace {
+         extensions.push_back(VK_KHR_ANDROID_SURFACE_EXTENSION_NAME);
+         break;
+ #elif defined(__HAIKU__)
+-    case Core::Frontend::WindowSystemType::Xcb:
+-        extensions.push_back(VK_KHR_XCB_SURFACE_EXTENSION_NAME);
++    case Core::Frontend::WindowSystemType::Haiku:
++        extensions.push_back(VK_EXT_HEADLESS_SURFACE_EXTENSION_NAME);
+         break;
+ #else
+     case Core::Frontend::WindowSystemType::X11:
+diff --git a/src/video_core/vulkan_common/vulkan_surface.cpp b/src/video_core/vulkan_common/vulkan_surface.cpp
+index 8b9dcb4..30b069d 100644
+--- a/src/video_core/vulkan_common/vulkan_surface.cpp
++++ b/src/video_core/vulkan_common/vulkan_surface.cpp
+@@ -7,6 +7,9 @@
+ #include "common/logging.h"
+ #include "core/frontend/emu_window.h"
+ #include "video_core/vulkan_common/vulkan_surface.h"
++#ifdef __HAIKU__
++#include "video_core/vulkan_common/vulkan_surface_haiku.h"
++#endif
+ #include "video_core/vulkan_common/vulkan_wrapper.h"
+ 
+ namespace Vulkan {
+@@ -60,19 +63,9 @@ vk::SurfaceKHR CreateSurface(
+         }
+     }
+ #elif defined(__HAIKU__)
+-    if (window_info.type == Core::Frontend::WindowSystemType::Xcb) {
+-        const VkXcbSurfaceCreateInfoKHR xcb_ci{
+-            .sType = VK_STRUCTURE_TYPE_XCB_SURFACE_CREATE_INFO_KHR,
+-            .pNext = nullptr,
+-            .flags = 0,
+-            .connection = static_cast<xcb_connection_t*>(window_info.display_connection),
+-            .window = xcb_window_t(uintptr_t(window_info.render_surface))
+-        };
+-        const auto vkCreateXcbSurfaceKHR = reinterpret_cast<PFN_vkCreateXcbSurfaceKHR>(
+-            dld.vkGetInstanceProcAddr(*instance, "vkCreateXcbSurfaceKHR"));
+-        if (!vkCreateXcbSurfaceKHR ||
+-            vkCreateXcbSurfaceKHR(*instance, &xcb_ci, nullptr, &unsafe_surface) != VK_SUCCESS) {
+-            LOG_ERROR(Render_Vulkan, "Failed to initialize Xcb surface");
++    if (window_info.type == Core::Frontend::WindowSystemType::Haiku) {
++        unsafe_surface = CreateHaikuSurface(*instance, dld, window_info.render_surface);
++        if (unsafe_surface == VK_NULL_HANDLE) {
+             throw vk::Exception(VK_ERROR_INITIALIZATION_FAILED);
+         }
+     }
+diff --git a/src/video_core/vulkan_common/vulkan_surface_haiku.cpp b/src/video_core/vulkan_common/vulkan_surface_haiku.cpp
+new file mode 100644
+index 0000000..3bc8643
+--- /dev/null
++++ b/src/video_core/vulkan_common/vulkan_surface_haiku.cpp
+@@ -0,0 +1,196 @@
++// SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
++// SPDX-License-Identifier: GPL-3.0-or-later
++
++// Vulkan presentation on Haiku.
++//
++// Haiku has no Vulkan surface extension of its own. Its hardware Vulkan
++// drivers (NVK on nvidia-haiku, RADV) present through X547's VideoStreamsWsi,
++// an implicit layer (VK_LAYER_window_system_integration) that implements
++// VK_EXT_headless_surface and VK_KHR_swapchain. The surface it returns is a
++// C++ object; giving it a BitmapHook makes the layer hand every presented
++// image to the hook as a BBitmap, which is drawn into the window here.
++
++#include <cstdlib>
++#include <cstring>
++#include <memory>
++#include <mutex>
++#include <unordered_map>
++#include <vector>
++
++#include <Bitmap.h>
++#include <Looper.h>
++#include <Messenger.h>
++#include <View.h>
++#include <Window.h>
++
++#include "common/logging.h"
++#include "video_core/vulkan_common/vulkan_surface_haiku.h"
++
++namespace Vulkan {
++
++namespace {
++
++// Interface of the layer's surface object, as declared in VideoStreamsWsi's
++// Wsi.cpp (MIT). The vtable layout must match the layer's.
++class BitmapHook {
++public:
++    virtual ~BitmapHook() {}
++    virtual void GetSize(uint32_t& width, uint32_t& height) = 0;
++    /// Takes the bitmap and returns the previous one for the layer to delete
++    virtual BBitmap* SetBitmap(BBitmap* bitmap) = 0;
++};
++
++class VKLayerSurfaceBase {
++public:
++    virtual ~VKLayerSurfaceBase() {}
++    virtual void SetBitmapHook(BitmapHook* hook) = 0;
++};
++
++constexpr char WSI_LAYER_NAME[] = "VK_LAYER_window_system_integration";
++
++// The window thread can be busy (resizing, or waiting for the emulator while
++// it shuts down); dropping a frame is better than blocking the presenter.
++constexpr bigtime_t WINDOW_LOCK_TIMEOUT = 20'000;
++
++/// Draws presented images into the first view of a BWindow (the view Qt
++/// draws the render widget with).
++class WindowBitmapHook final : public BitmapHook {
++public:
++    explicit WindowBitmapHook(BWindow* window) : messenger{window} {}
++
++    ~WindowBitmapHook() override {
++        delete bitmap;
++    }
++
++    void GetSize(uint32_t& width, uint32_t& height) override {
++        if (BView* view = LockView()) {
++            const BRect bounds = view->Bounds();
++            last_width = static_cast<uint32_t>(bounds.IntegerWidth() + 1);
++            last_height = static_cast<uint32_t>(bounds.IntegerHeight() + 1);
++            view->Window()->Unlock();
++        }
++        width = last_width;
++        height = last_height;
++    }
++
++    BBitmap* SetBitmap(BBitmap* new_bitmap) override {
++        BBitmap* previous = nullptr;
++        if (new_bitmap != bitmap) {
++            previous = bitmap;
++            bitmap = new_bitmap;
++        }
++        if (bitmap != nullptr) {
++            if (BView* view = LockView()) {
++                view->DrawBitmapAsync(bitmap, bitmap->Bounds(), view->Bounds());
++                view->Flush();
++                view->Window()->Unlock();
++            }
++        }
++        return previous;
++    }
++
++    bool IsValid() const {
++        return messenger.IsValid();
++    }
++
++private:
++    BView* LockView() {
++        if (messenger.LockTargetWithTimeout(WINDOW_LOCK_TIMEOUT) != B_OK) {
++            return nullptr;
++        }
++        BLooper* looper = nullptr;
++        messenger.Target(&looper);
++        auto* window = dynamic_cast<BWindow*>(looper);
++        BView* view = window != nullptr ? window->ChildAt(0) : nullptr;
++        if (view == nullptr && looper != nullptr) {
++            looper->Unlock();
++        }
++        return view;
++    }
++
++    BMessenger messenger;
++    BBitmap* bitmap = nullptr;
++    uint32_t last_width = 1;
++    uint32_t last_height = 1;
++};
++
++// One hook per window, reused for every surface made for that window. A hook
++// must outlive the surfaces it was given to, and the layer does not tell us
++// when it lets go of one, so hooks are kept until their window is gone.
++std::mutex hooks_mutex;
++std::unordered_map<BWindow*, std::unique_ptr<WindowBitmapHook>> hooks;
++
++WindowBitmapHook* HookForWindow(BWindow* window) {
++    std::scoped_lock lock{hooks_mutex};
++    std::erase_if(hooks, [](const auto& entry) { return !entry.second->IsValid(); });
++    auto& hook = hooks[window];
++    if (!hook) {
++        hook = std::make_unique<WindowBitmapHook>(window);
++    }
++    return hook.get();
++}
++
++bool IsWsiLayerActive(const vk::InstanceDispatch& dld) {
++    if (const char* disabled = std::getenv("DISABLE_VIDEOSTREAMS_WSI_LAYER");
++        disabled != nullptr && std::strcmp(disabled, "1") == 0) {
++        return false;
++    }
++    const auto enumerate = reinterpret_cast<PFN_vkEnumerateInstanceLayerProperties>(
++        dld.vkGetInstanceProcAddr(VK_NULL_HANDLE, "vkEnumerateInstanceLayerProperties"));
++    if (enumerate == nullptr) {
++        return false;
++    }
++    uint32_t count = 0;
++    if (enumerate(&count, nullptr) != VK_SUCCESS) {
++        return false;
++    }
++    std::vector<VkLayerProperties> layers(count);
++    if (enumerate(&count, layers.data()) != VK_SUCCESS) {
++        return false;
++    }
++    for (const auto& layer : layers) {
++        if (std::strcmp(layer.layerName, WSI_LAYER_NAME) == 0) {
++            return true;
++        }
++    }
++    return false;
++}
++
++} // Anonymous namespace
++
++VkSurfaceKHR CreateHaikuSurface(VkInstance instance, const vk::InstanceDispatch& dld,
++                                void* window_handle) {
++    auto* window = static_cast<BWindow*>(window_handle);
++    if (window == nullptr) {
++        LOG_ERROR(Render_Vulkan, "No window to present to");
++        return VK_NULL_HANDLE;
++    }
++    // Without the layer the surface is not its object, and SetBitmapHook()
++    // below would call into something else.
++    if (!IsWsiLayerActive(dld)) {
++        LOG_ERROR(Render_Vulkan, "Vulkan presentation on Haiku needs the {} layer "
++                                 "(VideoStreamsWsi, installed with the GPU driver)",
++                  WSI_LAYER_NAME);
++        return VK_NULL_HANDLE;
++    }
++    const auto vkCreateHeadlessSurfaceEXT = reinterpret_cast<PFN_vkCreateHeadlessSurfaceEXT>(
++        dld.vkGetInstanceProcAddr(instance, "vkCreateHeadlessSurfaceEXT"));
++    if (vkCreateHeadlessSurfaceEXT == nullptr) {
++        LOG_ERROR(Render_Vulkan, "vkCreateHeadlessSurfaceEXT is not available");
++        return VK_NULL_HANDLE;
++    }
++    const VkHeadlessSurfaceCreateInfoEXT headless_ci{
++        .sType = VK_STRUCTURE_TYPE_HEADLESS_SURFACE_CREATE_INFO_EXT,
++        .pNext = nullptr,
++        .flags = 0,
++    };
++    VkSurfaceKHR surface = VK_NULL_HANDLE;
++    if (vkCreateHeadlessSurfaceEXT(instance, &headless_ci, nullptr, &surface) != VK_SUCCESS) {
++        LOG_ERROR(Render_Vulkan, "Failed to create the headless surface");
++        return VK_NULL_HANDLE;
++    }
++    reinterpret_cast<VKLayerSurfaceBase*>(surface)->SetBitmapHook(HookForWindow(window));
++    return surface;
++}
++
++} // namespace Vulkan
+diff --git a/src/video_core/vulkan_common/vulkan_surface_haiku.h b/src/video_core/vulkan_common/vulkan_surface_haiku.h
+new file mode 100644
+index 0000000..23ee538
+--- /dev/null
++++ b/src/video_core/vulkan_common/vulkan_surface_haiku.h
+@@ -0,0 +1,15 @@
++// SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
++// SPDX-License-Identifier: GPL-3.0-or-later
++
++#pragma once
++
++#include "video_core/vulkan_common/vulkan_wrapper.h"
++
++namespace Vulkan {
++
++/// Creates a surface presenting into the given BWindow, or VK_NULL_HANDLE.
++[[nodiscard]] VkSurfaceKHR CreateHaikuSurface(VkInstance instance,
++                                              const vk::InstanceDispatch& dld,
++                                              void* window_handle);
++
++} // namespace Vulkan
+-- 
+2.43.0
+
+
+From f74290cc3ea8a75020a00c037a100d55c324948c Mon Sep 17 00:00:00 2001
+From: Techniix <Techniix@users.noreply.github.com>
+Date: Mon, 9 Nov 2026 15:54:26 -0500
+Subject: [PATCH 4/5] common: build fixes and Haiku user directories
+
+Link libnetwork by name instead of a fixed path, and fall back to
+find_directory() for the data, cache and settings directories when the
+XDG variables are not set.
+
+Assisted-by: Claude Opus 5.5 (draft; not yet built or run)
+---
+ CMakeLists.txt              |  4 ++--
+ src/common/fs/path_util.cpp | 21 +++++++++++++++++++++
+ 2 files changed, 23 insertions(+), 2 deletions(-)
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 04d0f17..12db526 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -549,8 +549,8 @@ elseif (WIN32)
+ elseif (MANAGARM)
+     set(PLATFORM_LIBRARIES iconv intl)
+ elseif (HAIKUOS)
+-    # Haiku is so special :)
+-    set(PLATFORM_LIBRARIES bsd /boot/system/lib/libnetwork.so)
++    # Sockets are in libnetwork, BSD extensions in libbsd
++    set(PLATFORM_LIBRARIES bsd network)
+ elseif (CMAKE_SYSTEM_NAME MATCHES "^(Linux|kFreeBSD|GNU|SunOS)$")
+     set(PLATFORM_LIBRARIES rt)
+ endif()
+diff --git a/src/common/fs/path_util.cpp b/src/common/fs/path_util.cpp
+index a075dcf..ceee214 100644
+--- a/src/common/fs/path_util.cpp
++++ b/src/common/fs/path_util.cpp
+@@ -28,6 +28,10 @@
+ #include <unistd.h>    // Used in GetDataDirectory()
+ #endif
+ 
++#ifdef __HAIKU__
++#include <FindDirectory.h> // Used in GetDataDirectory()
++#endif
++
+ #ifdef __APPLE__
+ #include <sys/param.h> // Used in GetBundleDirectory()
+ 
+@@ -381,6 +385,23 @@ fs::path GetDataDirectory(const std::string& env_name) {
+         return fs::path{data_env_var};
+     }
+ 
++#ifdef __HAIKU__
++    // Haiku's profile normally sets the XDG variables to these directories
++    // (~/config/non-packaged/data, ~/config/cache, ~/config/settings); use
++    // them too when the program was started without it.
++    directory_which which = B_USER_NONPACKAGED_DATA_DIRECTORY;
++    if (env_name == "XDG_CACHE_HOME") {
++        which = B_USER_CACHE_DIRECTORY;
++    } else if (env_name == "XDG_CONFIG_HOME") {
++        which = B_USER_SETTINGS_DIRECTORY;
++    } else if (env_name != "XDG_DATA_HOME") {
++        return {};
++    }
++    char path[B_PATH_NAME_LENGTH];
++    if (find_directory(which, -1, true, path, sizeof(path)) == B_OK) {
++        return fs::path{path};
++    }
++#endif
+     if (env_name == "XDG_DATA_HOME") {
+         return GetHomeDirectory() / ".local/share";
+     } else if (env_name == "XDG_CACHE_HOME") {
+-- 
+2.43.0
+
+
+From 66ebc2b97c3639d062c2aefccf75e7eef7c7305c Mon Sep 17 00:00:00 2001
+From: Techniix <Techniix@users.noreply.github.com>
+Date: Mon, 9 Nov 2026 19:39:48 -0500
+Subject: [PATCH 5/5] common: detect hole punching and memory hints by feature
+
+Returning guest memory with fallocate(FALLOC_FL_PUNCH_HOLE), and the
+MADV_HUGEPAGE and MADV_PAGEOUT hints, were tied to __linux__. Test for
+the flags instead, so other systems get them as soon as their headers
+define them. Linux builds are unchanged: glibc defines all of them.
+
+On Haiku none of them exist yet and the memset path stays. Renga plans
+hole punching on memfds and huge user pages (roadmap F-48); with this
+change they switch on without touching the port again.
+
+Assisted-by: Claude Opus 5.5 (draft; not yet built or run)
+---
+ src/common/host_memory.cpp | 18 +++++++++++++-----
+ 1 file changed, 13 insertions(+), 5 deletions(-)
+
+diff --git a/src/common/host_memory.cpp b/src/common/host_memory.cpp
+index b60af6a..72effb7 100644
+--- a/src/common/host_memory.cpp
++++ b/src/common/host_memory.cpp
+@@ -36,6 +36,13 @@
+ #include <orbis/libkernel.h>
+ #endif
+ 
++// Returning a range of the backing file to the kernel. Detected by its flag
++// rather than the platform; on Haiku-based systems it is planned in Renga's
++// libgnu (roadmap F-48) and switches on here once <fcntl.h> defines it.
++#if defined(FALLOC_FL_PUNCH_HOLE) && defined(FALLOC_FL_KEEP_SIZE)
++#define HOST_MEMORY_PUNCH_HOLE 1
++#endif
++
+ // FreeBSD
+ #ifndef MAP_NORESERVE
+ #define MAP_NORESERVE 0
+@@ -520,7 +527,7 @@ public:
+         , virtual_size{virtual_size_}
+     {}
+ 
+-#ifdef __linux__
++#ifdef HOST_MEMORY_PUNCH_HOLE
+     bool PunchHole(size_t offset, size_t length) {
+         return fd >= 0 &&
+                fallocate(fd, FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE, static_cast<off_t>(offset),
+@@ -585,7 +592,8 @@ public:
+             LOG_CRITICAL(HW_Memory, "mmap failed: {}", strerror(errno));
+             return false;
+         }
+-#if defined(__linux__)
++#if defined(MADV_HUGEPAGE)
++        // Not on Haiku yet: huge user pages are planned in Renga (roadmap F-48)
+         madvise(virtual_base, virtual_size, MADV_HUGEPAGE);
+ #endif
+         free_manager.SetAddressSpace(virtual_base, virtual_size);
+@@ -815,7 +823,7 @@ void HostMemory::HintCold(size_t physical_offset, size_t length,
+ #ifdef _WIN32
+         // Unlocking pages that are not locked takes them out of the working set.
+         VirtualUnlock(address, length);
+-#elif defined(__linux__) && defined(MADV_PAGEOUT)
++#elif defined(MADV_PAGEOUT)
+         madvise(address, length, MADV_PAGEOUT);
+ #else
+         static_cast<void>(address);
+@@ -840,7 +848,7 @@ void HostMemory::ClearBackingRegion(size_t physical_offset, size_t length, u32 f
+     // Fresh backing memory is zero and the host gives it no RAM until it's touched: clear only
+     // the granules that may hold data (title 1's heap made the host commit every page of it).
+     // A granule cleared in full is zero again.
+-#ifdef __linux__
++#ifdef HOST_MEMORY_PUNCH_HOLE
+     // Handing a whole granule back to the kernel frees its RAM; a memset would commit it.
+     static const bool punch = [] {
+         const char* value = std::getenv("EDEN_PUNCH_HOLE");
+@@ -856,7 +864,7 @@ void HostMemory::ClearBackingRegion(size_t physical_offset, size_t length, u32 f
+         if ((granules[index].load(std::memory_order_acquire) & GranuleDirty) != 0) {
+             const bool whole = offset == granule_begin && clear_end == granule_end;
+             bool cleared = false;
+-#ifdef __linux__
++#ifdef HOST_MEMORY_PUNCH_HOLE
+             cleared = whole && punch && impl && impl->PunchHole(granule_begin, granule_end - granule_begin);
+ #endif
+             if (!cleared) {
+-- 
+2.43.0
+

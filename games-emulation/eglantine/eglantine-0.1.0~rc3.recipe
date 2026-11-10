@@ -1,0 +1,190 @@
+SUMMARY="A Nintendo Switch 2 emulator"
+DESCRIPTION="Eglantine is a free and open source Nintendo Switch 2 emulator \
+derived from Eden, yuzu and Sudachi. It runs games you own, with your own \
+console keys and firmware, and renders with Vulkan or OpenGL.
+
+This build is for Renga. It uses Renga's memfd_create() for guest memory, \
+fastmem in the CPU recompiler, and Vulkan presentation through the \
+VideoStreamsWsi layer that Haiku's hardware Vulkan drivers (NVK on the \
+nvidia-haiku driver, RADV) install. Without such a driver it falls back to \
+OpenGL in software."
+HOMEPAGE="https://github.com/Djihads80/Eglantine"
+COPYRIGHT="2018-2024 yuzu Emulator Project
+	2025-2026 Eden Emulator Project
+	2026 Eglantine contributors"
+LICENSE="GNU GPL v3"
+REVISION="1"
+srcGitRev="78743f30c251f66bd77e6eea6c28d8632d642d6f"
+SOURCE_URI="git+https://github.com/Djihads80/Eglantine.git#$srcGitRev"
+PATCHES="eglantine-$portVersion.patchset"
+ADDITIONAL_FILES="eglantine.rdef"
+
+# Libraries Eglantine pins that HaikuPorts does not package (or packages at
+# a version Eglantine cannot mix with the others); their commits are the
+# versions in upstream's cpmfile.json. CMake is pointed at them with
+# <Package>_CUSTOM_DIR and <Package>_FORCE_BUNDLED, so the build downloads
+# nothing and does not pick up a different system copy.
+SOURCE_URI_2="git+https://github.com/eden-emulator/sirit.git#b870b062998244231a4f08004d3b25151732c5c5"	# v1.0.5
+SOURCE_URI_3="git+https://github.com/herumi/xbyak.git#964adcd198c716c0691c7d73f6c2be73db6682bd"	# v7.40.1
+SOURCE_URI_4="git+https://github.com/serge-sans-paille/frozen.git#61dce5ae18ca59931e27675c468e64118aba8744"
+SOURCE_URI_5="git+https://github.com/GPUOpen-LibrariesAndSDKs/VulkanMemoryAllocator.git#1d8f600fd424278486eade7ed3e877c99f0846b1"	# v3.3.0
+# Vulkan headers and utility libraries must be bundled together (upstream's
+# AddDependentPackages); HaikuPorts has no Vulkan-Utility-Libraries.
+SOURCE_URI_6="git+https://github.com/KhronosGroup/Vulkan-Headers.git#74d8a6cb930c68ef617b202c3ff3c59d919e086b"	# v1.4.345
+SOURCE_URI_7="git+https://github.com/KhronosGroup/Vulkan-Utility-Libraries.git#20fb10eb1ec08ccd5cacec32b7df1b0e99e48a0c"	# v1.4.345
+SOURCE_URI_8="git+https://github.com/yhirose/cpp-httplib.git#008e107d0fcddee7cb96dc5ad3c3189fd090e40a"	# v0.46.0
+SOURCE_URI_9="git+https://github.com/kinnay/zbic.git#11b08f2712264bbed731545085cbd9702096ceb7"
+SOURCE_URI_10="git+https://github.com/FeralInteractive/gamemode.git#ce6fe122f3864cb29d9a6a2ec68b6d78239074b1"
+# Always bundled upstream: zstd so that NUP archives are byte-identical
+# everywhere, Opus because upstream pins a commit with its own patches.
+SOURCE_URI_11="git+https://github.com/facebook/zstd.git#33618c89e511637f8a6ef955b3501766d71feb53"
+SOURCE_URI_12="git+https://github.com/xiph/opus.git#a3f0ec02b34281c38aefdaf4bbbd5787ad641d62"
+# Time zone data converted for the Switch. Upstream publishes only a SHA-512
+# (cce65a12...d008ed); HaikuPorter prints the SHA-256 on the first fetch.
+SOURCE_URI_13="https://git.eden-emu.dev/eden-emu/tzdb_to_nx/releases/download/230326/230326.tar.gz"
+SOURCE_FILENAME_13="nx_tzdb-230326.tar.gz"
+SOURCE_DIR_13=""
+
+ARCHITECTURES="!x86_gcc2 !x86 x86_64"
+
+PROVIDES="
+	eglantine = $portVersion
+	app:Eglantine = $portVersion
+	"
+REQUIRES="
+	haiku
+	lib:libavcodec
+	lib:libavfilter
+	lib:libavutil
+	lib:libboost_context
+	lib:libboost_fiber
+	lib:libboost_filesystem
+	lib:libcrypto
+	lib:libenet
+	lib:libfmt
+	lib:libgnu
+	lib:liblz4
+	lib:libquazip1_qt6
+	lib:libQt6Charts
+	lib:libQt6Concurrent
+	lib:libQt6Core
+	lib:libQt6Gui
+	lib:libQt6Widgets
+	lib:libSDL3
+	lib:libssl
+	lib:libswresample
+	lib:libswscale
+	lib:libvulkan
+	lib:libz
+	"
+# "renga >= 1" is left out until Renga's system package provides "renga"
+# (roadmap F-45); with it the package could not be installed anywhere yet.
+
+BUILD_REQUIRES="
+	haiku_devel
+	devel:libavcodec
+	devel:libavfilter
+	devel:libavutil
+	devel:libboost_context
+	devel:libboost_fiber
+	devel:libboost_filesystem
+	devel:libcrypto
+	devel:libenet
+	devel:libfmt
+	devel:liblz4
+	devel:libquazip1_qt6
+	devel:libQt6Charts
+	devel:libQt6Core
+	devel:libSDL3
+	devel:libssl
+	devel:libswresample
+	devel:libswscale
+	devel:libvulkan
+	devel:libz
+	nlohmann_json
+	simpleini_devel
+	spirv_headers
+	"
+BUILD_PREREQUIRES="
+	cmd:cmake
+	cmd:g++
+	cmd:gcc
+	cmd:git
+	cmd:glslang
+	cmd:make
+	cmd:ninja
+	cmd:pkg_config
+	"
+
+PATCH()
+{
+	# Upstream applies these to its own Opus download; a custom directory
+	# skips them, and the second keeps Opus out of the install.
+	cd $sourceDir12
+	for p in $sourceDir/.patch/opus/*.patch; do
+		patch -p1 < "$p"
+	done
+}
+
+BUILD()
+{
+	local tzdb=$(dirname "$(find $sourceDir13 -maxdepth 3 -type d -name zoneinfo | head -n 1)")
+
+	# Host shaders are compiled with the glslang command: upstream's Haiku
+	# build avoids glslangValidator, which crashes in ShFinalize() (HaikuPorts
+	# issue 13083; upstream docs/Caveats.md has a patch if glslang does too).
+	cmake -B build -S . -G Ninja \
+		$cmakeDirArgs \
+		-DCMAKE_BUILD_TYPE=Release \
+		-DENABLE_WERROR=OFF \
+		-DENABLE_QT=ON \
+		-DENABLE_QT_TRANSLATION=OFF \
+		-DENABLE_UPDATE_CHECKER=OFF \
+		-DENABLE_WEB_SERVICE=OFF \
+		-DENABLE_CUBEB=OFF \
+		-DENABLE_RESHADE=OFF \
+		-DENABLE_NVIDIA_DLSS=OFF \
+		-DUSE_DISCORD_PRESENCE=OFF \
+		-DYUZU_CMD=OFF \
+		-DYUZU_ROOM_STANDALONE=OFF \
+		-DYUZU_TESTS=OFF \
+		-DBUILD_TESTING=OFF \
+		-DYUZU_USE_BUNDLED_QT=OFF \
+		-DYUZU_USE_BUNDLED_SDL3=OFF \
+		-DYUZU_USE_BUNDLED_FFMPEG=OFF \
+		-DYUZU_USE_BUNDLED_OPENSSL=OFF \
+		-DYUZU_USE_BUNDLED_SIRIT=OFF \
+		-DYUZU_TZDB_PATH="$tzdb" \
+		-Dsirit_CUSTOM_DIR=$sourceDir2 \
+		-Dsirit_FORCE_BUNDLED=ON \
+		-Dxbyak_CUSTOM_DIR=$sourceDir3 \
+		-Dxbyak_FORCE_BUNDLED=ON \
+		-Dfrozen_CUSTOM_DIR=$sourceDir4 \
+		-Dfrozen_FORCE_BUNDLED=ON \
+		-DVulkanMemoryAllocator_CUSTOM_DIR=$sourceDir5 \
+		-DVulkanMemoryAllocator_FORCE_BUNDLED=ON \
+		-DVulkanHeaders_CUSTOM_DIR=$sourceDir6 \
+		-DVulkanHeaders_FORCE_BUNDLED=ON \
+		-DVulkanUtilityLibraries_CUSTOM_DIR=$sourceDir7 \
+		-DVulkanUtilityLibraries_FORCE_BUNDLED=ON \
+		-Dhttplib_CUSTOM_DIR=$sourceDir8 \
+		-Dhttplib_FORCE_BUNDLED=ON \
+		-Dzbic_CUSTOM_DIR=$sourceDir9 \
+		-Dzbic_FORCE_BUNDLED=ON \
+		-Dgamemode_CUSTOM_DIR=$sourceDir10 \
+		-Dgamemode_FORCE_BUNDLED=ON \
+		-Dzstd_CUSTOM_DIR=$sourceDir11 \
+		-Dzstd_FORCE_BUNDLED=ON \
+		-DOpus_CUSTOM_DIR=$sourceDir12 \
+		-DOpus_FORCE_BUNDLED=ON
+	ninja -C build $jobArgs
+}
+
+INSTALL()
+{
+	mkdir -p $appsDir/Eglantine
+	cp build/bin/eglantine $appsDir/Eglantine/Eglantine
+	addResourcesToBinaries $portDir/additional-files/eglantine.rdef \
+		$appsDir/Eglantine/Eglantine
+	addAppDeskbarSymlink $appsDir/Eglantine/Eglantine
+}
