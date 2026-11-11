@@ -1,0 +1,83 @@
+SUMMARY="Cross platform audio library, with a Media Kit back end"
+DESCRIPTION="Cubeb is a cross-platform audio library, written in C/C++, \
+created and maintained by the Firefox Media Team, and used by Firefox and \
+several emulators.
+This Renga build adds a back end for the Haiku/Renga Media Kit: output \
+streams play through BSoundPlayer on the system mixer, so each program \
+shows up with its own volume, mute and output in the audio settings, \
+follows the default output, and can use Renga's low-latency mode (the \
+latency a program asks cubeb for becomes the player's fixed buffer \
+length). Input streams are not supported yet."
+HOMEPAGE="https://github.com/mozilla/cubeb/"
+COPYRIGHT="Mozilla Foundation
+	2026 Renga contributors (Media Kit back end)"
+LICENSE="ISC"
+REVISION="1"
+gitRevision="dcd7cddafa4b95776cf5d117549ad58e17f23764"
+SOURCE_URI="git+https://github.com/mozilla/cubeb.git#$gitRevision"
+PATCHES="cubeb-$portVersion.patchset"
+
+ARCHITECTURES="x86_64"
+
+# Same name as HaikuPorts' cubeb (0.2~git20201209, which has no Haiku back
+# end): on Renga this repository is preferred, so programs linking
+# libcubeb get the Media Kit back end without a rebuild.
+PROVIDES="
+	cubeb = $portVersion
+	lib:libcubeb = $portVersion compat >= 0
+	"
+REQUIRES="
+	haiku
+	"
+
+PROVIDES_devel="
+	cubeb_devel = $portVersion
+	devel:libcubeb = $portVersion compat >= 0
+	"
+REQUIRES_devel="
+	haiku
+	lib:libcubeb == $portVersion base
+	"
+
+BUILD_REQUIRES="
+	haiku_devel
+	"
+BUILD_PREREQUIRES="
+	cmd:cmake
+	cmd:gcc
+	cmd:git
+	cmd:ld
+	cmd:make
+	"
+
+BUILD()
+{
+	# speex is bundled; sanitizers and the Rust back ends are not used
+	cmake -Bbuild -S. $cmakeDirArgs \
+		-DCMAKE_BUILD_TYPE=Release \
+		-DCMAKE_INSTALL_BINDIR=$binDir \
+		-DBUILD_SHARED_LIBS=ON \
+		-DBUILD_TESTS=OFF \
+		-DBUILD_TOOLS=ON \
+		-DUSE_SANITIZERS=OFF \
+		-DBUILD_RUST_LIBS=OFF
+	make -C build $jobArgs
+}
+
+INSTALL()
+{
+	make -C build install
+
+	prepareInstalledDevelLib libcubeb
+
+	packageEntries devel \
+		$developDir \
+		$libDir/cmake
+}
+
+# Not built or run yet: there is no Renga machine with HaikuPorter here.
+# The back end (src/cubeb_haiku.cpp in the patchset) was compile-checked
+# with the Renga cross compiler and headers. Manual check on Renga, with
+# the media services running: "cubeb-test p" plays a sine through the
+# default back end (the Media preferences list it under Applications),
+# "q" quits.

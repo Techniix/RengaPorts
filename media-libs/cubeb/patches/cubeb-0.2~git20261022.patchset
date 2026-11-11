@@ -1,0 +1,434 @@
+From ab4e34757bf43238bf3b45c504832453f323303d Mon Sep 17 00:00:00 2001
+From: Renga contributors <noreply@anthropic.com>
+Date: Wed, 11 Nov 2026 01:50:45 -0500
+Subject: [PATCH] Add a Haiku/Renga Media Kit back end
+
+Output streams on BSoundPlayer through the system mixer; the latency
+asked for becomes the player's fixed buffer length. Input is not
+implemented yet.
+---
+ CMakeLists.txt      |   8 +
+ src/cubeb.c         |  14 ++
+ src/cubeb_haiku.cpp | 345 ++++++++++++++++++++++++++++++++++++++++++++
+ 3 files changed, 367 insertions(+)
+ create mode 100644 src/cubeb_haiku.cpp
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 5c1482a..fac49de 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -363,6 +363,14 @@ if(USE_SUN)
+   target_compile_definitions(cubeb PRIVATE USE_SUN)
+ endif()
+ 
++if(HAIKU)
++  # The Media Kit back end (BSoundPlayer on the system mixer)
++  target_sources(cubeb PRIVATE src/cubeb_haiku.cpp)
++  target_compile_definitions(cubeb PRIVATE USE_HAIKU)
++  target_link_libraries(cubeb PRIVATE be media)
++  list(APPEND private_libs be media)
++endif()
++
+ check_include_files(kai.h USE_KAI)
+ if(USE_KAI)
+   target_sources(cubeb PRIVATE
+diff --git a/src/cubeb.c b/src/cubeb.c
+index c47d4b8..3b97e79 100644
+--- a/src/cubeb.c
++++ b/src/cubeb.c
+@@ -88,6 +88,10 @@ audiotrack_init(cubeb ** context, char const * context_name);
+ int
+ kai_init(cubeb ** context, char const * context_name);
+ #endif
++#if defined(USE_HAIKU)
++int
++haiku_init(cubeb ** context, char const * context_name);
++#endif
+ 
+ static int
+ validate_stream_params(cubeb_stream_params * input_stream_params,
+@@ -214,6 +218,10 @@ cubeb_init(cubeb ** context, char const * context_name,
+     } else if (!strcmp(backend_name, "kai")) {
+ #if defined(USE_KAI)
+       init_oneshot = kai_init;
++#endif
++    } else if (!strcmp(backend_name, "haiku")) {
++#if defined(USE_HAIKU)
++      init_oneshot = haiku_init;
+ #endif
+     } else {
+       /* Already set */
+@@ -270,6 +278,9 @@ cubeb_init(cubeb ** context, char const * context_name,
+ #endif
+ #if defined(USE_KAI)
+       kai_init,
++#endif
++#if defined(USE_HAIKU)
++      haiku_init,
+ #endif
+   };
+   int i;
+@@ -353,6 +364,9 @@ cubeb_get_backend_names()
+ #endif
+ #if defined(USE_KAI)
+       "kai",
++#endif
++#if defined(USE_HAIKU)
++      "haiku",
+ #endif
+   };
+ 
+diff --git a/src/cubeb_haiku.cpp b/src/cubeb_haiku.cpp
+new file mode 100644
+index 0000000..960821b
+--- /dev/null
++++ b/src/cubeb_haiku.cpp
+@@ -0,0 +1,345 @@
++/*
++ * Copyright 2026, Renga contributors.
++ *
++ * This program is made available under an ISC-style license, as cubeb
++ * itself.  See the accompanying file LICENSE for details.
++ */
++
++/*	A cubeb back end for the Haiku/Renga Media Kit (RengaPorts; roadmap
++	F-31 of github.com/Techniix/haiku). Output streams play through
++	BSoundPlayer on the system mixer, so they show up per application in
++	the audio settings, follow the default output and get Renga's
++	low-latency mode: the latency cubeb asks for becomes BSoundPlayer's
++	buffer length, so every data callback asks for the same number of
++	frames. Input streams are not implemented yet (CUBEB_ERROR_NOT_SUPPORTED;
++	the Media Kit's BMediaRecorder on the default input is the way).
++*/
++
++#include <MediaDefs.h>
++#include <MediaRoster.h>
++#include <SoundPlayer.h>
++#include <OS.h>
++
++#include <math.h>
++#include <stdlib.h>
++#include <string.h>
++
++#include "cubeb-internal.h"
++#include "cubeb/cubeb.h"
++
++namespace {
++
++const uint32_t kMaxChannels = 8;
++// The default buffer length when cubeb asks for none: BSoundPlayer's own
++// (10 ms). Renga's low-latency mode lowers it for applications the user
++// switched to low latency.
++const uint32_t kMinLatencyFrames = 128;
++
++} // namespace
++
++extern "C" int
++haiku_init(cubeb ** context, char const * context_name);
++
++extern struct cubeb_ops const haiku_ops;
++
++struct cubeb {
++  struct cubeb_ops const * ops;
++};
++
++struct cubeb_stream {
++  /* Note: Must match cubeb_stream layout in cubeb.c. */
++  cubeb * context;
++  void * user_ptr;
++  /**/
++  cubeb_stream_params params;
++  cubeb_data_callback data_callback;
++  cubeb_state_callback state_callback;
++
++  BSoundPlayer * player;
++  sem_id lock;
++  uint64_t frames_played;
++  bool drained;
++  bool started;
++};
++
++static void
++haiku_lock(cubeb_stream * stm)
++{
++  while (acquire_sem(stm->lock) == B_INTERRUPTED)
++    ;
++}
++
++static void
++haiku_unlock(cubeb_stream * stm)
++{
++  release_sem(stm->lock);
++}
++
++/* BSoundPlayer's callback: one buffer of the negotiated, fixed length. */
++static void
++haiku_play_buffer(void * cookie, void * buffer, size_t size,
++                  media_raw_audio_format const & format)
++{
++  cubeb_stream * stm = static_cast<cubeb_stream *>(cookie);
++  size_t sample = format.format & media_raw_audio_format::B_AUDIO_SIZE_MASK;
++  size_t frame_size = sample * format.channel_count;
++  long wanted = frame_size > 0 ? size / frame_size : 0;
++
++  haiku_lock(stm);
++  bool drained = stm->drained;
++  haiku_unlock(stm);
++  if (drained || wanted <= 0) {
++    memset(buffer, 0, size);
++    return;
++  }
++
++  long got = stm->data_callback(stm, stm->user_ptr, NULL, buffer, wanted);
++  if (got < 0) {
++    memset(buffer, 0, size);
++    stm->state_callback(stm, stm->user_ptr, CUBEB_STATE_ERROR);
++    haiku_lock(stm);
++    stm->drained = true;
++    haiku_unlock(stm);
++    return;
++  }
++  if (got < wanted)
++    memset(static_cast<char *>(buffer) + got * frame_size, 0,
++           (wanted - got) * frame_size);
++
++  haiku_lock(stm);
++  stm->frames_played += got;
++  if (got < wanted)
++    stm->drained = true;
++  haiku_unlock(stm);
++
++  if (got < wanted)
++    stm->state_callback(stm, stm->user_ptr, CUBEB_STATE_DRAINED);
++}
++
++static char const *
++haiku_get_backend_id(cubeb * context)
++{
++  return "haiku";
++}
++
++static int
++haiku_get_max_channel_count(cubeb * context, uint32_t * max_channels)
++{
++  *max_channels = kMaxChannels;
++  return CUBEB_OK;
++}
++
++static int
++haiku_get_min_latency(cubeb * context, cubeb_stream_params params,
++                      uint32_t * latency_frames)
++{
++  *latency_frames = kMinLatencyFrames;
++  return CUBEB_OK;
++}
++
++static int
++haiku_get_preferred_sample_rate(cubeb * context, uint32_t * rate)
++{
++  // The system mixer's rate, which is the default output's.
++  *rate = 48000;
++  BMediaRoster * roster = BMediaRoster::Roster();
++  media_node mixer;
++  if (roster != NULL && roster->GetAudioMixer(&mixer) == B_OK) {
++    media_output output;
++    int32 count = 0;
++    if (roster->GetConnectedOutputsFor(mixer, &output, 1, &count) == B_OK &&
++        count == 1 && output.format.u.raw_audio.frame_rate > 0)
++      *rate = (uint32_t)output.format.u.raw_audio.frame_rate;
++    roster->ReleaseNode(mixer);
++  }
++  return CUBEB_OK;
++}
++
++static void
++haiku_destroy(cubeb * context)
++{
++  free(context);
++}
++
++static void
++haiku_stream_destroy(cubeb_stream * stm);
++
++static int
++haiku_stream_init(cubeb * context, cubeb_stream ** stream,
++                  char const * stream_name, cubeb_devid input_device,
++                  cubeb_stream_params * input_stream_params,
++                  cubeb_devid output_device,
++                  cubeb_stream_params * output_stream_params,
++                  unsigned int latency_frames,
++                  cubeb_data_callback data_callback,
++                  cubeb_state_callback state_callback, void * user_ptr)
++{
++  *stream = NULL;
++  if (input_stream_params != NULL)
++    return CUBEB_ERROR_NOT_SUPPORTED;
++  if (output_stream_params == NULL)
++    return CUBEB_ERROR_INVALID_PARAMETER;
++  if (output_device != NULL)
++    return CUBEB_ERROR_DEVICE_UNAVAILABLE;
++  if (output_stream_params->prefs & CUBEB_STREAM_PREF_LOOPBACK)
++    return CUBEB_ERROR_NOT_SUPPORTED;
++  if (output_stream_params->channels < 1 ||
++      output_stream_params->channels > kMaxChannels)
++    return CUBEB_ERROR_INVALID_FORMAT;
++
++  media_multi_audio_format format = media_multi_audio_format::wildcard;
++  switch (output_stream_params->format) {
++  case CUBEB_SAMPLE_S16NE:
++    format.format = media_raw_audio_format::B_AUDIO_SHORT;
++    break;
++  case CUBEB_SAMPLE_FLOAT32NE:
++    format.format = media_raw_audio_format::B_AUDIO_FLOAT;
++    break;
++  default:
++    return CUBEB_ERROR_INVALID_FORMAT;
++  }
++  format.frame_rate = output_stream_params->rate;
++  format.channel_count = output_stream_params->channels;
++  format.byte_order = B_MEDIA_HOST_ENDIAN;
++  if (latency_frames < kMinLatencyFrames)
++    latency_frames = kMinLatencyFrames;
++  // One buffer of the latency asked for: BSoundPlayer keeps this length
++  // for the whole connection, so callbacks always ask for this many frames.
++  format.buffer_size = latency_frames * format.channel_count *
++                       (format.format &
++                        media_raw_audio_format::B_AUDIO_SIZE_MASK);
++
++  cubeb_stream * stm =
++      static_cast<cubeb_stream *>(calloc(1, sizeof(cubeb_stream)));
++  if (stm == NULL)
++    return CUBEB_ERROR;
++  stm->context = context;
++  stm->user_ptr = user_ptr;
++  stm->params = *output_stream_params;
++  stm->data_callback = data_callback;
++  stm->state_callback = state_callback;
++  stm->lock = create_sem(1, "cubeb stream");
++  if (stm->lock < 0) {
++    free(stm);
++    return CUBEB_ERROR;
++  }
++
++  stm->player = new (std::nothrow)
++      BSoundPlayer(&format, stream_name != NULL ? stream_name : "cubeb",
++                   haiku_play_buffer, NULL, stm);
++  if (stm->player == NULL || stm->player->InitCheck() != B_OK) {
++    haiku_stream_destroy(stm);
++    return CUBEB_ERROR;
++  }
++
++  *stream = stm;
++  return CUBEB_OK;
++}
++
++static void
++haiku_stream_destroy(cubeb_stream * stm)
++{
++  if (stm->player != NULL) {
++    stm->player->Stop();
++    delete stm->player;
++  }
++  if (stm->lock >= 0)
++    delete_sem(stm->lock);
++  free(stm);
++}
++
++static int
++haiku_stream_start(cubeb_stream * stm)
++{
++  haiku_lock(stm);
++  stm->drained = false;
++  stm->started = true;
++  haiku_unlock(stm);
++  if (stm->player->Start() != B_OK)
++    return CUBEB_ERROR;
++  stm->player->SetHasData(true);
++  stm->state_callback(stm, stm->user_ptr, CUBEB_STATE_STARTED);
++  return CUBEB_OK;
++}
++
++static int
++haiku_stream_stop(cubeb_stream * stm)
++{
++  stm->player->SetHasData(false);
++  stm->player->Stop();
++  haiku_lock(stm);
++  stm->started = false;
++  haiku_unlock(stm);
++  stm->state_callback(stm, stm->user_ptr, CUBEB_STATE_STOPPED);
++  return CUBEB_OK;
++}
++
++static int
++haiku_stream_get_position(cubeb_stream * stm, uint64_t * position)
++{
++  // Frames handed over minus those still on their way to the card.
++  uint32_t latency = 0;
++  bigtime_t microseconds = stm->player->Latency();
++  if (microseconds > 0)
++    latency = (uint32_t)(microseconds * stm->params.rate / 1000000);
++  haiku_lock(stm);
++  uint64_t played = stm->frames_played;
++  haiku_unlock(stm);
++  *position = played > latency ? played - latency : 0;
++  return CUBEB_OK;
++}
++
++static int
++haiku_stream_get_latency(cubeb_stream * stm, uint32_t * latency)
++{
++  bigtime_t microseconds = stm->player->Latency();
++  *latency = microseconds > 0
++                 ? (uint32_t)(microseconds * stm->params.rate / 1000000)
++                 : 0;
++  return CUBEB_OK;
++}
++
++static int
++haiku_stream_set_volume(cubeb_stream * stm, float volume)
++{
++  // BSoundPlayer's volume is the stream's gain in the system mixer.
++  stm->player->SetVolume(volume);
++  return CUBEB_OK;
++}
++
++struct cubeb_ops const haiku_ops = {
++    /*.init =*/haiku_init,
++    /*.get_backend_id =*/haiku_get_backend_id,
++    /*.get_max_channel_count =*/haiku_get_max_channel_count,
++    /*.get_min_latency =*/haiku_get_min_latency,
++    /*.get_preferred_sample_rate =*/haiku_get_preferred_sample_rate,
++    /*.get_supported_input_processing_params =*/NULL,
++    /*.enumerate_devices =*/NULL,
++    /*.device_collection_destroy =*/NULL,
++    /*.destroy =*/haiku_destroy,
++    /*.stream_init =*/haiku_stream_init,
++    /*.stream_destroy =*/haiku_stream_destroy,
++    /*.stream_start =*/haiku_stream_start,
++    /*.stream_stop =*/haiku_stream_stop,
++    /*.stream_get_position =*/haiku_stream_get_position,
++    /*.stream_get_latency =*/haiku_stream_get_latency,
++    /*.stream_get_input_latency =*/NULL,
++    /*.stream_set_volume =*/haiku_stream_set_volume,
++    /*.stream_set_name =*/NULL,
++    /*.stream_get_current_device =*/NULL,
++    /*.stream_set_input_mute =*/NULL,
++    /*.stream_set_input_processing_params =*/NULL,
++    /*.stream_device_destroy =*/NULL,
++    /*.stream_register_device_changed_callback =*/NULL,
++    /*.register_device_collection_changed =*/NULL};
++
++extern "C" int
++haiku_init(cubeb ** context, char const * context_name)
++{
++  cubeb * ctx = static_cast<cubeb *>(calloc(1, sizeof(cubeb)));
++  if (ctx == NULL)
++    return CUBEB_ERROR;
++  ctx->ops = &haiku_ops;
++  *context = ctx;
++  return CUBEB_OK;
++}
+-- 
+2.43.0
+
