@@ -12,6 +12,19 @@
 # Status: written against MediaPlayerPrivateHaiku.cpp of haikuwebkit's
 # "haiku" branch; not built or run yet (HaikuWebKit needs a Haiku build
 # host). Build with HaikuPorter on Renga and check with a muted video page.
+#
+# Open (found 2026-11-11 with media_html5_test in the Renga harness, using
+# the packaged 1.10.0 binary): WebM and MP4 clips play (the "playing"
+# event fires, the frames show), but their sound has gaps (WebM: about
+# 90 % of 10 ms blocks silent) or is missing (MP4). The Media Kit part of
+# the same path (BMediaFile on the URL, the decoded format handed to a
+# BSoundPlayer, one ReadFrames() per callback) plays both clips cleanly in
+# the same test, so the cause is in MediaPlayerPrivateHaiku: it decodes the
+# video frame inside the sound player's callback (a real-time thread),
+# which an emulated CPU does not finish in time, and it reads one decoded
+# chunk per callback whatever the buffer size. The fix is a video thread
+# of its own and filling each audio buffer completely; not written yet
+# because it cannot be built or measured without a Haiku build host.
 SUMMARY="Open source web browser engine"
 DESCRIPTION="
 WebKit is an open source web browser engine. WebKit is also the name of the \
