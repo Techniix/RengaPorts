@@ -1,0 +1,6 @@
+#!/bin/sh
+# package_repo for Linux x86_64 hosts (GitHub Actions ubuntu-24.04), built
+# from Renga's tree (generated.x86_64/objects/linux/.../tools/package_repo).
+# Needs glibc 2.38 or later, libstdc++, zlib and zstd.
+here="$(cd "$(dirname "$0")" && pwd)/linux-x86_64"
+LD_LIBRARY_PATH="$here${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" exec "$here/package_repo" "$@"

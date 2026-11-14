@@ -1,0 +1,62 @@
+# Adds each new OpenCE package to the Renga repository (the packages branch).
+#
+# OpenCE for Haiku (Techniix/OpenCE_HaikuOS) publishes a release only when
+# OpenCE changes; each release (tag build-N, newest = latest) carries
+# opence-N-1-x86_64.hpkg and SHA256SUMS. This job runs daily, does nothing
+# when the newest package is already here, and otherwise checks it against
+# SHA256SUMS and adds it with the repository's own update-repo.sh (which
+# replaces the older opence package and rebuilds the index with
+# package_repo; tools/host has a Linux build of it).
+name: Import OpenCE package
+
+on:
+  schedule:
+    - cron: "41 7 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: package-repository
+  cancel-in-progress: false
+
+jobs:
+  import:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Fetch the newest OpenCE package
+        id: fetch
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          src=Techniix/OpenCE_HaikuOS
+          tag=$(gh api "repos/$src/releases/latest" --jq .tag_name)
+          asset=$(gh api "repos/$src/releases/latest" \
+            --jq '[.assets[].name | select(test("^opence-[0-9]+-[0-9]+-x86_64\\.hpkg$"))][0] // ""')
+          if [ -z "$asset" ]; then
+            echo "Release $tag has no opence package; nothing to do."
+            echo "skip=1" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          if git fetch -q --depth 1 origin packages \
+            && [ -n "$(git ls-tree --name-only FETCH_HEAD "x86_64/current/packages/$asset")" ]; then
+            echo "$asset is already in the repository; nothing to do."
+            echo "skip=1" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          dir="$RUNNER_TEMP/opence"; mkdir -p "$dir"
+          gh release download "$tag" -R "$src" -D "$dir" -p "$asset" -p SHA256SUMS
+          expected=$(awk -v f="$asset" '{n=$2; sub(/^\*/, "", n)} n == f {print $1}' "$dir/SHA256SUMS")
+          [ -n "$expected" ] || { echo "SHA256SUMS has no entry for $asset"; exit 1; }
+          echo "$expected  $dir/$asset" | sha256sum -c -
+          echo "file=$dir/$asset" >> "$GITHUB_OUTPUT"
+
+      - name: Add it to the repository
+        if: steps.fetch.outputs.skip != '1'
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          PACKAGE_REPO="$GITHUB_WORKSPACE/tools/host/package_repo" tools/update-repo.sh "${{ steps.fetch.outputs.file }}"
