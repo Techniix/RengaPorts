@@ -49,8 +49,8 @@ index e099587..0ba09d4 100644
 From 23794508920444eeaca48c4113e06bf9afcd410d Mon Sep 17 00:00:00 2001
 From: Techniix <techniix@users.noreply.github.com>
 Date: Sat, 14 Nov 2026 16:12:04 -0500
-Subject: [PATCH] Renga: Linux evdev joysticks and HIDAPI on hidraw, without
- udev
+Subject: [PATCH 1/2] Renga: Linux evdev joysticks and HIDAPI on hidraw,
+ without udev
 
 Renga (a Haiku-based system) publishes every game controller as a Linux
 evdev device in /dev/input (with uinput and force feedback) and raw HID
@@ -1434,6 +1434,89 @@ index ede0d5e..8aa7905 100644
  // This isn't defined in older Linux kernel headers
  #ifndef MSC_TIMESTAMP
  #define MSC_TIMESTAMP 0x05
+-- 
+2.43.0
+
+
+From a493fcc0a5b4a7f05d2742570ff1e81a9526c736 Mon Sep 17 00:00:00 2001
+From: Techniix <techniix@users.noreply.github.com>
+Date: Sat, 14 Nov 2026 17:25:48 -0500
+Subject: [PATCH 2/2] Renga: lock SDL's BApplication start and stop
+
+Subsystems initialized from several threads at once (audio and gamepads
+on one, video and the window on another, as OpenCE does) raced in
+SDL_InitBeApp(): both threads saw no BApplication and both started one
+("2 BApplication objects were created"), or the window was created
+after the application had gone (BWindow: "You need a valid BApplication
+object"). The reference count and the start and stop are now done under
+one mutex.
+---
+ src/core/haiku/SDL_BeApp.cc | 14 ++++++++++++++
+ 1 file changed, 14 insertions(+)
+
+diff --git a/src/core/haiku/SDL_BeApp.cc b/src/core/haiku/SDL_BeApp.cc
+index e1f7d5d..2cda5bd 100644
+--- a/src/core/haiku/SDL_BeApp.cc
++++ b/src/core/haiku/SDL_BeApp.cc
+@@ -30,6 +30,7 @@
+ #include <storage/Entry.h>
+ #include <storage/File.h>
+ #include <unistd.h>
++#include <pthread.h>
+ #include <memory>
+ 
+ #include "SDL_BApp.h"   // SDL_BLooper class definition
+@@ -45,6 +46,14 @@ extern "C" {
+ 
+ // Flag to tell whether or not the Be application and looper are active or not
+ static int SDL_BeAppActive = 0;
++
++/* Renga: subsystems initialized from several threads at once (OpenCE: audio
++   and gamepads on one, video and the window on another) raced here: both
++   saw no BApplication, both started one ("2 BApplication objects were
++   created"), or one saw the reference count drop and quit the application
++   the other was about to use (BWindow: "You need a valid BApplication
++   object"). The count and the start and stop are now done under one lock. */
++static pthread_mutex_t SDL_BeAppLock = PTHREAD_MUTEX_INITIALIZER;
+ static SDL_Thread *SDL_AppThread = NULL;
+ SDL_BLooper *SDL_Looper = NULL;
+ 
+@@ -126,9 +135,11 @@ static bool StartBeLooper()
+ // Initialize the Be Application, if it's not already started
+ bool SDL_InitBeApp(void)
+ {
++    pthread_mutex_lock(&SDL_BeAppLock);
+     // Create the BApplication that handles appserver interaction
+     if (SDL_BeAppActive <= 0) {
+         if (!StartBeLooper()) {
++            pthread_mutex_unlock(&SDL_BeAppLock);
+             return false;
+         }
+ 
+@@ -138,6 +149,7 @@ bool SDL_InitBeApp(void)
+ 
+     // Increment the application reference count
+     ++SDL_BeAppActive;
++    pthread_mutex_unlock(&SDL_BeAppLock);
+ 
+     // The app is running, and we're ready to go
+     return true;
+@@ -146,6 +158,7 @@ bool SDL_InitBeApp(void)
+ // Quit the Be Application, if there's nothing left to do
+ void SDL_QuitBeApp(void)
+ {
++    pthread_mutex_lock(&SDL_BeAppLock);
+     // Decrement the application reference count
+     --SDL_BeAppActive;
+ 
+@@ -163,6 +176,7 @@ void SDL_QuitBeApp(void)
+         }
+         // be_app should now be NULL since be_app has quit
+     }
++    pthread_mutex_unlock(&SDL_BeAppLock);
+ }
+ 
+ #ifdef __cplusplus
 -- 
 2.43.0
 

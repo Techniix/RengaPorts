@@ -12,7 +12,7 @@ are the Haiku back ends. Replaces HaikuPorts' libsdl3 on Renga."
 HOMEPAGE="https://www.libsdl.org/"
 COPYRIGHT="1997-2026 Sam Lantinga"
 LICENSE="Zlib"
-REVISION="100"
+REVISION="101"
 # Revisions from 100 up: Renga builds of HaikuPorts packages keep the
 # version and take a revision above any HaikuPorts revision, so pkgman
 # replaces HaikuPorts' build (README, "Replacing HaikuPorts packages").
@@ -29,6 +29,10 @@ REVISION="100"
 #   drivers (Switch Pro Controller gyro and rumble, DualSense, ...).
 # - The BJoystick back end stays but is off unless SDL_JOYSTICK_HAIKU=1, so
 #   pads are not listed twice.
+# - (Third patch, revision 101) SDL's BApplication start and stop are
+#   locked: subsystems initialized from two threads at once (OpenCE) could
+#   start two BApplications or create a window after the application had
+#   gone; the crash OpenCE hit on hardware with revision 100.
 # Published in the Renga repository, which has priority over HaikuPorts on
 # Renga, so it replaces HaikuPorts' libsdl3 there; Renga images carry it
 # (3rdparty/ce/Jamfile in the Renga tree pins the package's SHA-256).
