@@ -1,0 +1,117 @@
+SUMMARY="Simple Direct Media Layer 3.0 (Renga build with evdev and hidraw gamepads)"
+DESCRIPTION="Simple DirectMedia Layer is a cross-platform development library \
+designed to provide low level access to audio, keyboard, mouse, joystick, and \
+graphics hardware via OpenGL and Direct3D. It is used by video playback \
+software, emulators, and popular games.
+
+Renga build: game controllers come from Renga's Linux evdev devices \
+(/dev/input/event*, hot-plugged with inotify) and raw HID controllers from \
+/dev/hidraw* (HIDAPI: gyro, rumble and lights of Switch, PlayStation and other \
+pads), so the controller database's entries apply. Video, audio and the rest \
+are the Haiku back ends. Replaces HaikuPorts' libsdl3 on Renga."
+HOMEPAGE="https://www.libsdl.org/"
+COPYRIGHT="1997-2026 Sam Lantinga"
+LICENSE="Zlib"
+REVISION="1"
+# Renga build (Techniix/RengaPorts): HaikuPorts' libsdl3 recipe and patch,
+# plus Renga's patch (the second one in the patchset):
+# - SDL's Linux joystick and haptic back ends on Renga's evdev devices in
+#   /dev/input (gamepad core, uinput, force feedback), hot-plugged through
+#   inotify; there is no udev or sysfs. Their GUIDs are Linux's, so the
+#   controller database's Linux entries apply. HaikuPorts' build only has
+#   the BJoystick back end, whose GUIDs match no database entry, so
+#   SDL_GetGamepads() listed nothing (found with OpenCE on hardware).
+# - HIDAPI on /dev/hidraw* (src/hidapi/renga/hid.c: linux/hid.c with the
+#   udev and sysfs parts replaced by hidraw ioctls), for SDL's HIDAPI
+#   drivers (Switch Pro Controller gyro and rumble, DualSense, ...).
+# - The BJoystick back end stays but is off unless SDL_JOYSTICK_HAIKU=1, so
+#   pads are not listed twice.
+# Published in the Renga repository, which has priority over HaikuPorts on
+# Renga, so it replaces HaikuPorts' libsdl3 there; Renga images carry it
+# (3rdparty/ce/Jamfile in the Renga tree pins the package's SHA-256).
+# Needs Renga's haiku_devel for <linux/joystick.h> (Renga after 2026-11-14).
+SOURCE_URI="https://www.libsdl.org/release/SDL3-$portVersion.tar.gz"
+CHECKSUM_SHA256="7322236cd12090c3eb40b9728be4d49c76f66ad17d04369584d4ecad5cf77c68"
+PATCHES="libsdl3-$portVersion.patchset"
+SOURCE_DIR="SDL3-$portVersion"
+
+ARCHITECTURES="!all x86_64"
+SECONDARY_ARCHITECTURES=""
+
+libVersion="0.4.16"
+libVersionCompat="$libVersion compat >= ${libVersion%%.*}"
+
+PROVIDES="
+	libsdl3$secondaryArchSuffix = $portVersion compat >= 3.0
+	lib:libSDL3$secondaryArchSuffix = $libVersionCompat
+	"
+REQUIRES="
+	haiku$secondaryArchSuffix
+	renga
+	lib:libGL$secondaryArchSuffix
+	"
+
+PROVIDES_devel="
+	libsdl3${secondaryArchSuffix}_devel = $portVersion compat >= 3.0
+	devel:libSDL3$secondaryArchSuffix = $libVersionCompat
+	devel:libSDL3_test$secondaryArchSuffix = $portVersion
+	"
+REQUIRES_devel="
+	libsdl3$secondaryArchSuffix == $portVersion base
+	"
+
+BUILD_REQUIRES="
+	haiku${secondaryArchSuffix}_devel
+	devel:libGL$secondaryArchSuffix
+	"
+BUILD_PREREQUIRES="
+	cmd:cmake
+	cmd:gcc$secondaryArchSuffix
+	cmd:ld$secondaryArchSuffix
+	cmd:ninja
+	cmd:pkg_config$secondaryArchSuffix
+	"
+
+BUILD()
+{
+	# Renga's Linux-style headers (<linux/input.h>, <linux/hidraw.h>,
+	# <linux/joystick.h>, <sys/inotify.h>) are in the gnu header directory.
+	export CFLAGS="$CFLAGS -D_DEFAULT_SOURCE -I$includeDir/gnu"
+	export CXXFLAGS="$CXXFLAGS -D_DEFAULT_SOURCE -I$includeDir/gnu"
+	cmake . -Bbuild -GNinja $cmakeDirArgs \
+		-DSDL_STATIC=OFF -DSDL_RPATH=OFF \
+		-DCMAKE_BUILD_TYPE=Release \
+		-DSDL_TESTS=ON
+	ninja -C build
+
+	# The configuration must have found Renga's devices.
+	grep -q '#define SDL_JOYSTICK_LINUX 1' build/include-config-release/build_config/SDL_build_config.h
+	grep -q '#define SDL_HIDAPI_RENGA 1' build/include-config-release/build_config/SDL_build_config.h
+}
+
+INSTALL()
+{
+	ninja -C build install
+
+	rm -rf $dataDir
+
+	# fix pkg-config paths
+	sed -i 's,${_IMPORT_PREFIX}/lib',$developLibDir, \
+		$libDir/cmake/SDL3/SDL3testTargets-release.cmake
+
+	# devel package
+	prepareInstalledDevelLibs \
+		libSDL3 \
+		libSDL3_test
+
+	fixPkgconfig
+
+	packageEntries devel \
+		$developDir \
+		$libDir/cmake
+}
+
+TEST()
+{
+	ctest --test-dir build
+}
