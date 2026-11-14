@@ -12,7 +12,8 @@ HOMEPAGE="https://github.com/mozilla/cubeb/"
 COPYRIGHT="Mozilla Foundation
 	2026 Renga contributors (Media Kit back end)"
 LICENSE="ISC"
-REVISION="1"
+REVISION="100"
+# Revisions from 100 up for Renga builds of HaikuPorts packages (README).
 gitRevision="dcd7cddafa4b95776cf5d117549ad58e17f23764"
 SOURCE_URI="git+https://github.com/mozilla/cubeb.git#$gitRevision"
 PATCHES="cubeb-$portVersion.patchset"

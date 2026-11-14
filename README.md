@@ -52,6 +52,16 @@ REQUIRES="
 Renga's system package provides `renga`, so `pkgman` and HaikuDepot refuse
 to install these packages on stock Haiku instead of failing at run time.
 
+### Replacing HaikuPorts packages
+
+A Renga build of a package HaikuPorts also has (same name, for example
+`libsdl3` or `ffmpeg6`) keeps HaikuPorts' version and uses a **revision
+from 100 up** (`REVISION="100"`, then 101, ...). The Renga repository has
+priority on Renga, but `pkgman update` only replaces an installed package
+with a newer version or revision, so a Renga build with the same revision
+as HaikuPorts' would never replace one already installed. HaikuPorts'
+revisions stay far below 100.
+
 ## Using the repository
 
 Renga images come with this repository configured. To add it by hand:
