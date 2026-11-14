@@ -49,7 +49,7 @@ index e099587..0ba09d4 100644
 From 23794508920444eeaca48c4113e06bf9afcd410d Mon Sep 17 00:00:00 2001
 From: Techniix <techniix@users.noreply.github.com>
 Date: Sat, 14 Nov 2026 16:12:04 -0500
-Subject: [PATCH 1/2] Renga: Linux evdev joysticks and HIDAPI on hidraw,
+Subject: [PATCH 1/3] Renga: Linux evdev joysticks and HIDAPI on hidraw,
  without udev
 
 Renga (a Haiku-based system) publishes every game controller as a Linux
@@ -1441,7 +1441,7 @@ index ede0d5e..8aa7905 100644
 From a493fcc0a5b4a7f05d2742570ff1e81a9526c736 Mon Sep 17 00:00:00 2001
 From: Techniix <techniix@users.noreply.github.com>
 Date: Sat, 14 Nov 2026 17:25:48 -0500
-Subject: [PATCH 2/2] Renga: lock SDL's BApplication start and stop
+Subject: [PATCH 2/3] Renga: lock SDL's BApplication start and stop
 
 Subsystems initialized from several threads at once (audio and gamepads
 on one, video and the window on another, as OpenCE does) raced in
@@ -1517,6 +1517,220 @@ index e1f7d5d..2cda5bd 100644
  }
  
  #ifdef __cplusplus
+-- 
+2.43.0
+
+
+From 011515ccad0863bcfdaee7518d6fe5cb32b0c0e1 Mon Sep 17 00:00:00 2001
+From: Techniix <techniix@users.noreply.github.com>
+Date: Sat, 14 Nov 2026 17:46:19 -0500
+Subject: [PATCH 3/3] Renga: windows wait for video init and for the
+ BApplication
+
+SDL_VideoInit() publishes the video device before the driver has added
+its displays and started its BApplication. A window created on another
+thread meanwhile (SDL_Init() on one thread, SDL_CreateWindow() on
+another, as OpenCE does) read the display list while it was being
+filled, or reached BWindow before be_app existed ("You need a valid
+BApplication object", OpenCE on a 12-thread CPU with 3.4.16-101).
+
+- SDL_CreateWindowWithProperties() waits while another thread is in
+  SDL_VideoInit() (Haiku only).
+- SDL_WaitBeApp(): waits (up to 10 s) until SDL's BApplication runs and
+  SDL_Looper runs; the Haiku window code calls it before making a
+  BWindow, and the message box calls it before making an application of
+  its own while video is initialized.
+---
+ src/core/haiku/SDL_BeApp.cc        | 36 ++++++++++++++++++++++++++++++
+ src/core/haiku/SDL_BeApp.h         |  3 +++
+ src/video/SDL_video.c              | 35 +++++++++++++++++++++++++++++
+ src/video/haiku/SDL_bmessagebox.cc |  5 +++++
+ src/video/haiku/SDL_bwindow.cc     |  6 +++++
+ 5 files changed, 85 insertions(+)
+
+diff --git a/src/core/haiku/SDL_BeApp.cc b/src/core/haiku/SDL_BeApp.cc
+index 2cda5bd..f957857 100644
+--- a/src/core/haiku/SDL_BeApp.cc
++++ b/src/core/haiku/SDL_BeApp.cc
+@@ -31,6 +31,8 @@
+ #include <storage/File.h>
+ #include <unistd.h>
+ #include <pthread.h>
++#include <errno.h>
++#include <time.h>
+ #include <memory>
+ 
+ #include "SDL_BApp.h"   // SDL_BLooper class definition
+@@ -54,6 +56,13 @@ static int SDL_BeAppActive = 0;
+    the other was about to use (BWindow: "You need a valid BApplication
+    object"). The count and the start and stop are now done under one lock. */
+ static pthread_mutex_t SDL_BeAppLock = PTHREAD_MUTEX_INITIALIZER;
++/* Renga: set when the BApplication runs (Run() started, no longer
++   launching) and SDL_Looper runs; SDL_WaitBeApp() waits for it. SDL_VideoInit()
++   publishes the video device before the driver's VideoInit() starts the
++   application, so another thread's SDL_CreateWindow() could get to BWindow
++   before be_app existed (OpenCE on a 12-thread CPU, libsdl3 3.4.16-101). */
++static pthread_cond_t SDL_BeAppReadyCond = PTHREAD_COND_INITIALIZER;
++static bool SDL_BeAppReady = false;
+ static SDL_Thread *SDL_AppThread = NULL;
+ SDL_BLooper *SDL_Looper = NULL;
+ 
+@@ -149,6 +158,8 @@ bool SDL_InitBeApp(void)
+ 
+     // Increment the application reference count
+     ++SDL_BeAppActive;
++    SDL_BeAppReady = true;
++    pthread_cond_broadcast(&SDL_BeAppReadyCond);
+     pthread_mutex_unlock(&SDL_BeAppLock);
+ 
+     // The app is running, and we're ready to go
+@@ -164,6 +175,7 @@ void SDL_QuitBeApp(void)
+ 
+     // If the reference count reached zero, clean up the app
+     if (SDL_BeAppActive == 0) {
++        SDL_BeAppReady = false;
+         SDL_Looper->Lock();
+         SDL_Looper->Quit();
+         SDL_Looper = NULL;
+@@ -183,6 +195,30 @@ void SDL_QuitBeApp(void)
+ }
+ #endif
+ 
++/* Renga: waits (up to 10 s) until SDL's BApplication and SDL_Looper run,
++   started by SDL_InitBeApp() on this or another thread. Everything that
++   makes a window calls it first. */
++bool SDL_WaitBeApp(void)
++{
++    struct timespec deadline;
++    clock_gettime(CLOCK_REALTIME, &deadline);
++    deadline.tv_sec += 10;
++
++    pthread_mutex_lock(&SDL_BeAppLock);
++    while (!SDL_BeAppReady) {
++        if (pthread_cond_timedwait(&SDL_BeAppReadyCond, &SDL_BeAppLock,
++                &deadline) == ETIMEDOUT) {
++            break;
++        }
++    }
++    const bool ready = SDL_BeAppReady && be_app != NULL && SDL_Looper != NULL;
++    pthread_mutex_unlock(&SDL_BeAppLock);
++    if (!ready) {
++        return SDL_SetError("The BApplication is not running");
++    }
++    return true;
++}
++
+ // SDL_BApp functions
+ void SDL_BLooper::ClearID(SDL_BWin *bwin) {
+     _SetSDLWindow(NULL, bwin->GetID());
+diff --git a/src/core/haiku/SDL_BeApp.h b/src/core/haiku/SDL_BeApp.h
+index 178adab..202f862 100644
+--- a/src/core/haiku/SDL_BeApp.h
++++ b/src/core/haiku/SDL_BeApp.h
+@@ -31,6 +31,9 @@ extern bool SDL_InitBeApp(void);
+ // Quit the Be Application, if there's nothing left to do
+ extern void SDL_QuitBeApp(void);
+ 
++// Renga: wait until the Be Application started by SDL_InitBeApp() runs
++extern bool SDL_WaitBeApp(void);
++
+ // Be Application Signature
+ extern const char *SDL_signature;
+ 
+diff --git a/src/video/SDL_video.c b/src/video/SDL_video.c
+index ce942bf..5050dd4 100644
+--- a/src/video/SDL_video.c
++++ b/src/video/SDL_video.c
+@@ -614,7 +614,39 @@ const char *SDL_GetVideoDriver(int index)
+ /*
+  * Initialize the video and event subsystems -- determine native pixel format
+  */
++#ifdef SDL_PLATFORM_HAIKU
++/* Renga: SDL_VideoInit() publishes the video device (_this) before the driver
++   has added its displays and started its application. A window created on
++   another thread meanwhile (OpenCE: SDL_Init() on one thread,
++   SDL_CreateWindow() on another) read the display list while it was being
++   filled (a crash in SDL_AddVideoDisplay) or reached BWindow before the
++   BApplication existed. SDL_CreateWindowWithProperties() waits while
++   another thread is in SDL_VideoInit(). */
++static SDL_AtomicInt SDL_video_initializing;
++static SDL_ThreadID SDL_video_init_thread;
++static bool SDL_VideoInit_Internal(const char *driver_name);
++
+ bool SDL_VideoInit(const char *driver_name)
++{
++    SDL_video_init_thread = SDL_GetCurrentThreadID();
++    SDL_SetAtomicInt(&SDL_video_initializing, 1);
++    const bool result = SDL_VideoInit_Internal(driver_name);
++    SDL_SetAtomicInt(&SDL_video_initializing, 0);
++    return result;
++}
++
++static void SDL_WaitForVideoInit(void)
++{
++    while (SDL_GetAtomicInt(&SDL_video_initializing) &&
++           SDL_video_init_thread != SDL_GetCurrentThreadID()) {
++        SDL_Delay(1);
++    }
++}
++
++static bool SDL_VideoInit_Internal(const char *driver_name)
++#else
++bool SDL_VideoInit(const char *driver_name)
++#endif
+ {
+     SDL_VideoDevice *video;
+     bool init_events = false;
+@@ -2389,6 +2421,9 @@ static SDL_WindowFlags SDL_GetWindowFlagProperties(SDL_PropertiesID props)
+ 
+ SDL_Window *SDL_CreateWindowWithProperties(SDL_PropertiesID props)
+ {
++#ifdef SDL_PLATFORM_HAIKU
++    SDL_WaitForVideoInit();
++#endif
+     SDL_Window *window;
+     const char *title = SDL_GetStringProperty(props, SDL_PROP_WINDOW_CREATE_TITLE_STRING, NULL);
+     int x = (int)SDL_GetNumberProperty(props, SDL_PROP_WINDOW_CREATE_X_NUMBER, SDL_WINDOWPOS_UNDEFINED);
+diff --git a/src/video/haiku/SDL_bmessagebox.cc b/src/video/haiku/SDL_bmessagebox.cc
+index d7e2600..c136f39 100644
+--- a/src/video/haiku/SDL_bmessagebox.cc
++++ b/src/video/haiku/SDL_bmessagebox.cc
+@@ -345,6 +345,11 @@ bool HAIKU_ShowMessageBox(const SDL_MessageBoxData *messageboxdata, int *buttonI
+ 	// "You need a valid BApplication object before interacting with the app_server."
+ 	// "2 BApplication objects were created. Only one is allowed."
+ 	std::unique_ptr<BApplication> application;
++	// Renga: while video is initialized, SDL's own application is (being)
++	// started on some thread: wait for it instead of making a second one.
++	if (SDL_WasInit(SDL_INIT_VIDEO)) {
++		SDL_WaitBeApp();
++	}
+ 	if (!be_app) {
+ 		application = std::unique_ptr<BApplication>(new(std::nothrow) BApplication(SDL_signature));
+ 		if (!application) {
+diff --git a/src/video/haiku/SDL_bwindow.cc b/src/video/haiku/SDL_bwindow.cc
+index eee7eb8..0eb171c 100644
+--- a/src/video/haiku/SDL_bwindow.cc
++++ b/src/video/haiku/SDL_bwindow.cc
+@@ -24,6 +24,7 @@
+ #include "../SDL_sysvideo.h"
+ 
+ #include "SDL_BWin.h"
++#include "../../core/haiku/SDL_BeApp.h"
+ #include <new>
+ 
+ // Define a path to window's BWIN data
+@@ -43,6 +44,11 @@ static SDL_INLINE SDL_BLooper *_GetBeLooper()
+ 
+ static bool _InitWindow(SDL_VideoDevice *_this, SDL_Window *window, SDL_PropertiesID create_props)
+ {
++    // Renga: another thread may still be starting the BApplication
++    if (!SDL_WaitBeApp()) {
++        return false;
++    }
++
+     uint32 flags = 0;
+     window_look look = B_TITLED_WINDOW_LOOK;
+ 
 -- 
 2.43.0
 
