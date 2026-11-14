@@ -12,7 +12,7 @@ are the Haiku back ends. Replaces HaikuPorts' libsdl3 on Renga."
 HOMEPAGE="https://www.libsdl.org/"
 COPYRIGHT="1997-2026 Sam Lantinga"
 LICENSE="Zlib"
-REVISION="102"
+REVISION="103"
 # Revisions from 100 up: Renga builds of HaikuPorts packages keep the
 # version and take a revision above any HaikuPorts revision, so pkgman
 # replaces HaikuPorts' build (README, "Replacing HaikuPorts packages").
@@ -29,14 +29,14 @@ REVISION="102"
 #   drivers (Switch Pro Controller gyro and rumble, DualSense, ...).
 # - The BJoystick back end stays but is off unless SDL_JOYSTICK_HAIKU=1, so
 #   pads are not listed twice.
-# - (Third patch, revision 101) SDL's BApplication start and stop are
-#   locked: subsystems initialized from two threads at once (OpenCE) could
-#   start two BApplications or create a window after the application had
-#   gone; the crash OpenCE hit on hardware with revision 100.
-# - (Fourth patch, revision 102) windows wait for the video init and for the
-#   BApplication: SDL_CreateWindow() on another thread while SDL_VideoInit()
-#   ran read the display list being filled or reached BWindow before be_app
-#   existed (OpenCE on a 12-thread CPU with revision 101).
+# - (Second Renga patch, revision 103) SDL's BApplication starts and stops
+#   only under SDL's control: the start and stop are locked, SDL_InitBeApp()
+#   waits for the application's ReadyToRun(), and a B_QUIT_REQUESTED from
+#   outside SDL becomes SDL_EVENT_QUIT instead of ending the application
+#   under SDL (OpenCE crashed in BWindow with revisions 100 to 102:
+#   "You need a valid BApplication object"); windows check that an
+#   application runs, and a window whose creation failed is destroyed
+#   safely. Revisions 101 and 102 tried narrower fixes and are replaced.
 # Published in the Renga repository, which has priority over HaikuPorts on
 # Renga, so it replaces HaikuPorts' libsdl3 there; Renga images carry it
 # (3rdparty/ce/Jamfile in the Renga tree pins the package's SHA-256).
