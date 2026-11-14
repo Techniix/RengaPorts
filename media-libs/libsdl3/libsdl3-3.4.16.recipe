@@ -12,7 +12,7 @@ are the Haiku back ends. Replaces HaikuPorts' libsdl3 on Renga."
 HOMEPAGE="https://www.libsdl.org/"
 COPYRIGHT="1997-2026 Sam Lantinga"
 LICENSE="Zlib"
-REVISION="103"
+REVISION="104"
 # Revisions from 100 up: Renga builds of HaikuPorts packages keep the
 # version and take a revision above any HaikuPorts revision, so pkgman
 # replaces HaikuPorts' build (README, "Replacing HaikuPorts packages").
@@ -37,6 +37,8 @@ REVISION="103"
 #   "You need a valid BApplication object"); windows check that an
 #   application runs, and a window whose creation failed is destroyed
 #   safely. Revisions 101 and 102 tried narrower fixes and are replaced.
+#   Revision 104 also logs the sender of such a quit request to the syslog
+#   ("SDL: B_QUIT_REQUESTED from team ..."), to find who sends it.
 # Published in the Renga repository, which has priority over HaikuPorts on
 # Renga, so it replaces HaikuPorts' libsdl3 there; Renga images carry it
 # (3rdparty/ce/Jamfile in the Renga tree pins the package's SHA-256).
