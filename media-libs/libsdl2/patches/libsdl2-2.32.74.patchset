@@ -1,0 +1,80 @@
+From 179831f552e3e57884287de8688659494376eb6c Mon Sep 17 00:00:00 2001
+From: Techniix <techniix@users.noreply.github.com>
+Date: Sun, 15 Nov 2026 01:23:33 -0500
+Subject: [PATCH] Renga: build on Haiku
+
+SDL3 defines no SDL_PLATFORM_UNIX on Haiku (the compiler has no
+__unix__), so sdl2-compat stopped at "Please define your platform".
+- Load libSDL3.so.0 with dlopen() on Haiku, as on other Unix systems.
+- OS_GetExeName(): the application image's path from
+  get_next_image_info(), as /proc/self/exe gives on Linux.
+- SDL_config.h: the generated Unix configuration on Haiku too, instead
+  of SDL_config_minimal.h with its "might be incomplete" warning.
+---
+ include/SDL2/SDL_config.h |  2 +-
+ src/sdl2_compat.c         | 22 ++++++++++++++++++++--
+ 2 files changed, 21 insertions(+), 3 deletions(-)
+
+diff --git a/include/SDL2/SDL_config.h b/include/SDL2/SDL_config.h
+index b01f975..19fd5ae 100644
+--- a/include/SDL2/SDL_config.h
++++ b/include/SDL2/SDL_config.h
+@@ -47,7 +47,7 @@
+ #include "SDL_config_emscripten.h"
+ #elif defined(__NGAGE__)
+ #include "SDL_config_ngage.h"
+-#elif defined(__unix__) || defined(__unix) || defined(unix)
++#elif defined(__unix__) || defined(__unix) || defined(unix) || defined(__HAIKU__)
+ #include "SDL_config_unix.h"
+ #else
+ /* This is a minimal configuration just to get SDL running on new platforms. */
+diff --git a/src/sdl2_compat.c b/src/sdl2_compat.c
+index b185240..affea2b 100644
+--- a/src/sdl2_compat.c
++++ b/src/sdl2_compat.c
+@@ -104,7 +104,7 @@ This breaks the build when creating SDL_ ## DisableScreenSaver
+ #include <sys/process.h> /* for getprogname() */
+ #endif
+ 
+-#if defined(SDL_PLATFORM_UNIX) || defined(__APPLE__)
++#if defined(SDL_PLATFORM_UNIX) || defined(__APPLE__) || defined(SDL_PLATFORM_HAIKU)
+ #ifndef PATH_MAX
+ #define PATH_MAX 1024
+ #endif
+@@ -444,7 +444,9 @@ static char loaderror[256];
+ 
+         return false; /* didn't find it anywhere reasonable. :( */
+     }
+-#elif defined(SDL_PLATFORM_UNIX)
++#elif defined(SDL_PLATFORM_UNIX) || defined(SDL_PLATFORM_HAIKU)
++    /* Haiku: SDL3 does not define SDL_PLATFORM_UNIX there (the compiler has
++       no __unix__), but dlopen() and the library name are the same. */
+     #include <dlfcn.h>
+     #include <SDL3/SDL_dlopennote.h>
+     #ifdef __ANDROID__
+@@ -645,6 +647,22 @@ static void OS_GetExeName(char *buf, const unsigned maxpath, bool *use_base_path
+         buf[0] = '\0';
+     }
+ }
++#elif defined(SDL_PLATFORM_HAIKU)
++#include <image.h>
++static void OS_GetExeName(char *buf, const unsigned maxpath, bool *use_base_path)
++{
++    /* the application image's path, as /proc/self/exe gives on Linux */
++    image_info info;
++    int32 cookie = 0;
++    buf[0] = '\0';
++    (void)use_base_path;
++    while (get_next_image_info(B_CURRENT_TEAM, &cookie, &info) == B_OK) {
++        if (info.type == B_APP_IMAGE) {
++            strlcpy(buf, info.name, maxpath);
++            break;
++        }
++    }
++}
+ #else
+ #warning Please implement this for your platform.
+ static void OS_GetExeName(char *buf, const unsigned maxpath, bool *use_base_path)
+-- 
+2.43.0
+

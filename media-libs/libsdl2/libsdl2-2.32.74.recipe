@@ -1,0 +1,102 @@
+SUMMARY="Simple Direct Media Layer 2.0 (sdl2-compat over Renga's SDL3)"
+DESCRIPTION="Simple DirectMedia Layer is a cross-platform development library \
+designed to provide low level access to audio, keyboard, mouse, joystick, and \
+graphics hardware via OpenGL and Direct3D. It is used by video playback \
+software, emulators, and popular games.
+Renga build: sdl2-compat, SDL's own SDL2 library that runs every SDL2 call \
+on SDL3. SDL2 programs use Renga's SDL3 (libsdl3 from the Renga \
+repository): game controllers from Renga's evdev and hidraw devices, with \
+the controller database's mappings, and SDL3's newer video and audio code. \
+Replaces HaikuPorts' libsdl2 on Renga."
+HOMEPAGE="https://github.com/libsdl-org/sdl2-compat"
+COPYRIGHT="1997-2026 Sam Lantinga"
+LICENSE="Zlib"
+REVISION="100"
+# Revisions from 100 up: Renga builds of HaikuPorts packages take a revision
+# above any HaikuPorts revision (README, "Replacing HaikuPorts packages").
+# This one also has a newer version than HaikuPorts' libsdl2 (2.32.10):
+# sdl2-compat's releases continue SDL2's version line (2.32.x) and keep its
+# ABI (libSDL2-2.0.so.0), so programs built against HaikuPorts' libsdl2 run
+# unchanged.
+# sdl2-compat has no SDL code of its own for video, audio or input: it
+# loads libSDL3.so.0 at run time with dlopen() (it does not link it) and
+# translates. Hence REQUIRES lists lib:libSDL3, at least 3.2.12 (sdl2-compat's
+# SDL3_REQUIRED_VER); on Renga that is Renga's libsdl3 (3.4.16-104 or later).
+# Renga patch (patches/libsdl2-2.32.74.patchset): SDL3 defines no
+# SDL_PLATFORM_UNIX on Haiku (the compiler has no __unix__), so upstream
+# stops at "Please define your platform". The patch loads libSDL3.so.0 with
+# dlopen() on Haiku as on other Unix systems, gets the program's path for
+# SDL's per-program quirks from get_next_image_info() (Linux reads
+# /proc/self/exe), and makes the installed SDL_config.h use the generated
+# Unix configuration instead of SDL_config_minimal.h, which warns "might be
+# incomplete" in every program that includes SDL.h.
+SOURCE_URI="https://www.libsdl.org/release/sdl2-compat-$portVersion.tar.gz"
+CHECKSUM_SHA256="ec68abde77e2e459c8abc4f9587b8976b5d2a657b2bfda2fb3a079b0f8924588"
+PATCHES="libsdl2-$portVersion.patchset"
+SOURCE_DIR="sdl2-compat-$portVersion"
+
+ARCHITECTURES="!all x86_64"
+SECONDARY_ARCHITECTURES=""
+
+libVersion="0.3200.74"
+PROVIDES="
+	libsdl2$secondaryArchSuffix = $portVersion compat >= 2.0
+	lib:libSDL2_2.0$secondaryArchSuffix = $libVersion compat >= 0
+	"
+REQUIRES="
+	haiku$secondaryArchSuffix
+	renga
+	lib:libSDL3$secondaryArchSuffix >= 0.3.12
+	"
+
+PROVIDES_devel="
+	libsdl2${secondaryArchSuffix}_devel = $portVersion compat >= 2.0
+	cmd:sdl2_config$secondaryArchSuffix = $portVersion compat >= 2.0
+	devel:libSDL2$secondaryArchSuffix = $libVersion compat >= 0
+	devel:libSDL2_2.0$secondaryArchSuffix = $libVersion compat >= 0
+	devel:libSDL2main$secondaryArchSuffix
+	devel:libSDL2_test$secondaryArchSuffix
+	"
+REQUIRES_devel="
+	libsdl2$secondaryArchSuffix == $portVersion base
+	"
+
+BUILD_REQUIRES="
+	haiku${secondaryArchSuffix}_devel
+	devel:libSDL3$secondaryArchSuffix >= 0.3.12
+	"
+BUILD_PREREQUIRES="
+	cmd:cmake
+	cmd:gcc$secondaryArchSuffix
+	cmd:ld$secondaryArchSuffix
+	cmd:ninja
+	"
+
+BUILD()
+{
+	cmake . -Bbuild -GNinja $cmakeDirArgs \
+		-DCMAKE_BUILD_TYPE=Release \
+		-DSDL2COMPAT_TESTS=OFF \
+		-DSDL2COMPAT_X11=OFF
+	ninja -C build
+}
+
+INSTALL()
+{
+	ninja -C build install
+
+	# devel package
+	prepareInstalledDevelLibs \
+		libSDL2 \
+		libSDL2-2.0 \
+		libSDL2main \
+		libSDL2_test
+
+	fixPkgconfig
+	fixDevelopLibDirReferences $binDir/sdl2-config
+
+	packageEntries devel \
+		$developDir $binDir/sdl2-config $dataDir $libDir/cmake
+
+	rm -rf $prefix/bin
+}
