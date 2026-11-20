@@ -8,6 +8,7 @@ COPYRIGHT="1999-2026 Brian Paul"
 LICENSE="MIT"
 REVISION="100"
 # Revisions from 100 up for Renga builds of HaikuPorts packages (README).
+# Superseded by mesa-26.3.0.recipe (revision 100, 2026-11-20, Quasar R-20).
 # Renga build (Techniix/RengaPorts): HaikuPorts' mesa 25.3.6 recipe moved to
 # Mesa 26.2.2, the version Quasar's NVK (Techniix/nvidia-haiku,
 # rtx5070-event-sync) is built from, so Renga's llvmpipe/lavapipe and

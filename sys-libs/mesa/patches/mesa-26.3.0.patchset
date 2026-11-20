@@ -1,0 +1,864 @@
+From 73df95dfafe91fbebad80f17f4c6ace173789445 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Thu, 19 Nov 2026 21:20:59 -0500
+Subject: [PATCH 1/6] vulkan/wsi: pass libbe on to the driver that links the
+ WSI
+
+The first build of the renga-26.3 branch on Renga (GCC 15.3) compiled
+all of NVK and then failed to link libvulkan_nouveau.so:
+
+  wsi_common_renga.cpp:370: undefined reference to `BBitmap::ColorSpace() const'
+  wsi_common_renga.cpp:288: undefined reference to `BScreen::BScreen(screen_id)'
+  ... be_app, B_MAIN_SCREEN_ID, BScreen::WaitForRetrace ...
+
+wsi_common_renga.cpp uses the Interface Kit, and meson.build adds
+cpp.find_library('be') to platform_deps, but platform_deps is only a
+dependency of the libvulkan_wsi static library. The driver pulls that
+library in through idep_vulkan_wsi with link_whole, and -lbe did not
+appear on its link line. Add platform_deps to idep_vulkan_wsi's
+dependencies so every driver that links the WSI also links its
+platform libraries.
+
+On other platforms platform_deps is empty or holds only DirectX headers
+(Windows), so nothing changes there.
+
+Not yet built on Renga.
+
+Generated-by: LLM
+Biblioklept: this commit message was written by an AI model.
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01AVRp8mDpV9jS7UpPk2uhfF
+(cherry picked from commit 423ba7c0ec99c1b39fb8866e3db71a17b6865b27)
+---
+ src/vulkan/wsi/meson.build | 5 ++++-
+ 1 file changed, 4 insertions(+), 1 deletion(-)
+
+diff --git a/src/vulkan/wsi/meson.build b/src/vulkan/wsi/meson.build
+index bc23ebe..617db1e 100644
+--- a/src/vulkan/wsi/meson.build
++++ b/src/vulkan/wsi/meson.build
+@@ -87,8 +87,11 @@ else
+     # Instruct users of this library to link with --whole-archive.  Otherwise,
+     # our weak function overloads may not resolve properly.
+     link_whole : libvulkan_wsi,
++    # platform_deps too: libbe for the Renga WSI. As a dependency of the
++    # static library only, -lbe did not reach the driver's link line and
++    # libvulkan_nouveau.so failed with undefined BBitmap/BScreen symbols.
+     dependencies : [
+-      idep_vulkan_wsi_headers, dep_libudev
++      idep_vulkan_wsi_headers, dep_libudev, platform_deps
+     ]
+   )
+ endif
+-- 
+2.43.0
+
+
+From 26a2a56a32a99d98e3905b11cc3784f547ebdde6 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Thu, 19 Nov 2026 21:27:21 -0500
+Subject: [PATCH 2/6] util: link libgnu for inotify on Renga
+
+fossilize_db.c uses inotify_init1(), inotify_add_watch() and
+inotify_rm_watch() when the top-level meson.build finds sys/inotify.h.
+Renga ships that header (headers/compatibility/gnu/sys/inotify.h) and
+implements the functions in libgnu (src/libs/gnu/inotify.cpp), not in
+libroot, and nothing in Mesa linked libgnu.
+
+NVK linked anyway because rustc's Haiku target adds -lbsd -lroot
+-lnetwork -lgnu to every link that includes Rust code. A driver without
+Rust code fails: the Zink build on Renga 143b8c30, from the same util
+sources, stopped at
+
+  fossilize_db.c:467: undefined reference to `inotify_init1'
+
+Add libgnu to libmesa_util's dependencies on Haiku/Renga whenever
+sys/inotify.h is present, so the dependency is stated rather than
+inherited from Rust.
+
+Not yet built on Renga.
+
+Generated-by: LLM
+Biblioklept: this commit message was written by an AI model.
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01AVRp8mDpV9jS7UpPk2uhfF
+(cherry picked from commit 32e1fb32c5ae1014925a2d359adce74b37d4a6ef)
+---
+ src/util/meson.build | 7 +++++++
+ 1 file changed, 7 insertions(+)
+
+diff --git a/src/util/meson.build b/src/util/meson.build
+index 72d8660..64d9d0e 100644
+--- a/src/util/meson.build
++++ b/src/util/meson.build
+@@ -336,6 +336,13 @@ if with_platform_haiku
+   deps_for_libmesa_util += dep_network
+ endif
+ 
++# Renga provides inotify, which fossilize_db.c uses when sys/inotify.h is
++# found, in libgnu rather than libroot. Link it explicitly: NVK only linked
++# so far because the Rust standard library happens to add -lgnu.
++if host_machine.system() == 'haiku' and cc.check_header('sys/inotify.h')
++  deps_for_libmesa_util += cc.find_library('gnu')
++endif
++
+ if with_perfetto
+   files_mesa_util += files(
+     'perf/u_perfetto.cc',
+-- 
+2.43.0
+
+
+From 8af33bcab554bc18c6e932d142a71f18c15a7657 Mon Sep 17 00:00:00 2001
+From: X512 <danger_mail@list.ru>
+Date: Fri, 20 Nov 2026 07:28:38 -0500
+Subject: [PATCH 3/6] zink: Haiku support (X512's haiku-zink, adapted to Mesa
+ 26.3)
+
+X512's "zink: Haiku support" (549fbf65) and "hgl: drop dead code"
+(b7b399ff) from X547/mesa haiku-zink, a Mesa 25.1-devel tree, carried to
+26.3 so that Renga's OpenGL (Zink on NVK) builds from the same Mesa as
+NVK instead of from a second, older tree.
+
+What the change does:
+
+- EGL on Haiku creates a Zink screen instead of a software one.
+- The hgl frontend gives Zink window drawables through kopper, as a
+  headless VkSurface plus the window's BitmapHook (the RengaWsi /
+  VideoStreams surface ABI, zink_kopper_haiku.cpp).
+- Kopper gets a KOPPER_HAIKU display-target type, keyed by the
+  BitmapHook.
+- kopper_loader_info gains bitmapHook.
+
+Changes from the original while carrying it:
+
+- kopper_interface.h moved to src/gallium/include; bitmapHook is added
+  there.
+- The kopper hunks are re-applied by hand against 26.3, which spells
+  unreachable() as UNREACHABLE(). Two switches (swapchain sizing, dts
+  table init) already list KOPPER_HAIKU in 26.3.
+- Dropped as unneeded on 26.3:
+  - the renderdoc_app.h hunk, which is upstream now;
+  - the libsync.h "#error" and the include guards around it in
+    egl_dri2.c and drisw.c (neither file is built for Haiku);
+  - the inline_sw_helper.h include, since egl_haiku.cpp includes
+    zink_public.h itself;
+  - whitespace-only hunks in zink_screen.c.
+- egl_haiku.cpp calls zink_create_screen() directly instead of keeping
+  the software path behind "#if 0", and fails eglInitialize cleanly
+  (EGL_NOT_INITIALIZED, winsys freed) when no Zink screen can be made,
+  instead of building a display on a NULL screen.
+
+Checked: tools/crosscheck/mesa.sh (clang -fsyntax-only for
+x86_64-unknown-haiku against Renga a1a83da2 headers) passes for all 23
+Zink sources, hgl.c and egl_haiku.cpp. Not built with GCC or run.
+
+Generated-by: LLM
+Biblioklept: the adaptation and this message were written by an AI model; the original code is X512's.
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01AVRp8mDpV9jS7UpPk2uhfF
+(cherry picked from commit 3e58647066206e64beafc62a240e63202bc514bd)
+---
+ src/egl/drivers/haiku/egl_haiku.cpp           | 13 ++++-
+ src/egl/meson.build                           |  2 +-
+ src/gallium/drivers/zink/meson.build          |  1 +
+ src/gallium/drivers/zink/zink_kopper.c        | 29 ++++++++++-
+ src/gallium/drivers/zink/zink_kopper.h        |  8 ++-
+ .../drivers/zink/zink_kopper_haiku.cpp        | 36 +++++++++++++
+ src/gallium/drivers/zink/zink_screen.c        |  4 ++
+ src/gallium/frontends/hgl/hgl.c               | 51 +++++++++++++++++--
+ src/gallium/frontends/hgl/hgl_context.h       |  5 --
+ src/gallium/include/kopper_interface.h        |  1 +
+ 10 files changed, 135 insertions(+), 15 deletions(-)
+ create mode 100644 src/gallium/drivers/zink/zink_kopper_haiku.cpp
+
+diff --git a/src/egl/drivers/haiku/egl_haiku.cpp b/src/egl/drivers/haiku/egl_haiku.cpp
+index f2f75c0..d6c5d20 100644
+--- a/src/egl/drivers/haiku/egl_haiku.cpp
++++ b/src/egl/drivers/haiku/egl_haiku.cpp
+@@ -52,6 +52,7 @@
+ #include <Bitmap.h>
+ 
+ extern "C" {
++#include "gallium/drivers/zink/zink_public.h"
+ #include "target-helpers/inline_sw_helper.h"
+ }
+ 
+@@ -232,7 +233,7 @@ haiku_swap_buffers(_EGLDisplay *disp, _EGLSurface *surf)
+    // flush back buffer and swap buffers if double buffering is used
+    if (backBuffer != NULL) {
+       screen->flush_frontbuffer(screen, st->pipe, backBuffer, 0, 0,
+-                                buffer->winsysContext, 1, NULL);
++                                buffer->winsysContext, 0, NULL);
+       std::swap(frontBuffer, backBuffer);
+       p_atomic_inc(&buffer->base.stamp);
+    }
+@@ -343,7 +344,15 @@ haiku_initialize_impl(_EGLDisplay *disp, void *platformDisplay)
+    disp->DriverData = (void *)hgl_dpy;
+ 
+    struct sw_winsys *winsys = hgl_create_sw_winsys();
+-   struct pipe_screen *screen = sw_screen_create(winsys);
++   // Renga: OpenGL is Zink on the GPU's Vulkan driver (NVK), never a
++   // software rasteriser.
++   struct pipe_screen *screen = zink_create_screen(winsys, NULL);
++   if (screen == NULL) {
++      winsys->destroy(winsys);
++      free(hgl_dpy);
++      disp->DriverData = NULL;
++      return _eglError(EGL_NOT_INITIALIZED, "eglInitialize: no Zink screen");
++   }
+    hgl_dpy->disp = hgl_create_display(screen);
+ 
+    disp->ClientAPIs = 0;
+diff --git a/src/egl/meson.build b/src/egl/meson.build
+index b055360..647132c 100644
+--- a/src/egl/meson.build
++++ b/src/egl/meson.build
+@@ -134,7 +134,7 @@ elif with_platform_haiku
+   incs_for_egl += [include_directories('../gallium/frontends/hgl')]
+ 
+   link_for_egl += [libmesa, libgallium, libswhgl, libsthgl, libglapi]
+-  deps_for_egl += [cpp.find_library('be'), driver_swrast]
++  deps_for_egl += [cpp.find_library('be'), driver_swrast, driver_zink]
+ elif with_platform_windows
+   c_args_for_egl += [
+     '-DEGLAPI=', '-DPUBLIC='
+diff --git a/src/gallium/drivers/zink/meson.build b/src/gallium/drivers/zink/meson.build
+index 073f0a4..34a4dc5 100644
+--- a/src/gallium/drivers/zink/meson.build
++++ b/src/gallium/drivers/zink/meson.build
+@@ -10,6 +10,7 @@ files_libzink = files(
+   'zink_compiler.c',
+   'zink_context.c',
+   'zink_kopper.c',
++  'zink_kopper_haiku.cpp',
+   'zink_descriptors.c',
+   'zink_draw.cpp',
+   'zink_fence.c',
+diff --git a/src/gallium/drivers/zink/zink_kopper.c b/src/gallium/drivers/zink/zink_kopper.c
+index 64cafb7..a657d31 100644
+--- a/src/gallium/drivers/zink/zink_kopper.c
++++ b/src/gallium/drivers/zink/zink_kopper.c
+@@ -79,6 +79,11 @@ init_dt_type(struct kopper_displaytarget *cdt)
+    case VK_STRUCTURE_TYPE_WIN32_SURFACE_CREATE_INFO_KHR:
+       cdt->type = KOPPER_WIN32;
+       break;
++#endif
++#ifdef __HAIKU__
++   case VK_STRUCTURE_TYPE_HEADLESS_SURFACE_CREATE_INFO_EXT:
++      cdt->type = KOPPER_HAIKU;
++      break;
+ #endif
+    default:
+       UNREACHABLE("unsupported!");
+@@ -118,6 +123,11 @@ kopper_CreateSurface(struct zink_screen *screen, struct kopper_displaytarget *cd
+       error = VKSCR(CreateWin32SurfaceKHR)(screen->instance, win32, NULL, &surface);
+       break;
+    }
++#endif
++#ifdef __HAIKU__
++   case VK_STRUCTURE_TYPE_HEADLESS_SURFACE_CREATE_INFO_EXT:
++      error = zink_kopper_create_surface_haiku(screen, &cdt->info, &surface);
++      break;
+ #endif
+    default:
+       UNREACHABLE("unsupported!");
+@@ -247,6 +257,11 @@ find_dt_entry(struct zink_screen *screen, const struct kopper_displaytarget *cdt
+       he = _mesa_hash_table_search(&screen->dts, win32->hwnd);
+       break;
+    }
++#endif
++#ifdef __HAIKU__
++   case KOPPER_HAIKU:
++      he = _mesa_hash_table_search(&screen->dts, cdt->info.bitmapHook);
++      break;
+ #endif
+    default:
+       UNREACHABLE("unsupported!");
+@@ -328,6 +343,7 @@ kopper_CreateSwapchain(struct zink_screen *screen, struct kopper_displaytarget *
+    switch (cdt->type) {
+    case KOPPER_X11:
+    case KOPPER_WIN32:
++   case KOPPER_HAIKU:
+       /* With Xcb, minImageExtent, maxImageExtent, and currentExtent must always equal the window size.
+        * ...
+        * Due to above restrictions, it is only possible to create a new swapchain on this
+@@ -465,6 +481,7 @@ zink_kopper_displaytarget_create(struct zink_screen *screen, unsigned tex_usage,
+             break;
+          case KOPPER_WAYLAND:
+          case KOPPER_WIN32:
++         case KOPPER_HAIKU:
+             _mesa_hash_table_init(&screen->dts, screen, _mesa_hash_pointer, _mesa_key_pointer_equal);
+             break;
+          default:
+@@ -536,6 +553,11 @@ zink_kopper_displaytarget_create(struct zink_screen *screen, unsigned tex_usage,
+       _mesa_hash_table_insert(&screen->dts, win32->hwnd, cdt);
+       break;
+    }
++#endif
++#ifdef __HAIKU__
++   case KOPPER_HAIKU:
++      _mesa_hash_table_insert(&screen->dts, cdt->info.bitmapHook, cdt);
++      break;
+ #endif
+    default:
+       UNREACHABLE("unsupported!");
+@@ -903,7 +925,7 @@ zink_kopper_present_queue(struct zink_screen *screen, struct zink_resource *res,
+       mesa_loge("ZINK: failed to allocate cpi!");
+       return;
+    }
+-      
++
+    cpi->sem = res->obj->present;
+    cpi->res = res;
+    cpi->swapchain = cdt->swapchain;
+@@ -926,8 +948,11 @@ zink_kopper_present_queue(struct zink_screen *screen, struct zink_resource *res,
+       cpi->region.rectangleCount = nrects;
+       cpi->region.pRectangles = cpi->regions;
+       for (unsigned i = 0; i < nrects; i++) {
++         fprintf(stderr, "i: %u\n", i);
++         fprintf(stderr, "cpi: %p\n", cpi);
++         fprintf(stderr, "boxes: %p\n", boxes);
+          cpi->regions[i].offset.x = boxes[i].x;
+-         /* 
++         /*
+             2) Where is the origin of the VkRectLayerKHR?
+ 
+             RESOLVED: The upper left corner of the presentable image(s) of the swapchain, per the definition of framebuffer coordinates.
+diff --git a/src/gallium/drivers/zink/zink_kopper.h b/src/gallium/drivers/zink/zink_kopper.h
+index 95fbcf9..27330c6 100644
+--- a/src/gallium/drivers/zink/zink_kopper.h
++++ b/src/gallium/drivers/zink/zink_kopper.h
+@@ -19,7 +19,7 @@
+  * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+  * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS
+  * IN THE SOFTWARE.
+- * 
++ *
+  * Authors:
+  *    Mike Blumenkrantz <michael.blumenkrantz@gmail.com>
+  */
+@@ -76,7 +76,8 @@ struct kopper_swapchain {
+ enum kopper_type {
+    KOPPER_X11,
+    KOPPER_WAYLAND,
+-   KOPPER_WIN32
++   KOPPER_WIN32,
++   KOPPER_HAIKU
+ };
+ 
+ struct kopper_displaytarget
+@@ -198,6 +199,9 @@ zink_kopper_prune_batch_usage(struct kopper_displaytarget *cdt, const struct zin
+ void
+ zink_kopper_set_readback_needs_update(struct zink_resource *res);
+ 
++VkResult
++zink_kopper_create_surface_haiku(struct zink_screen *screen, struct kopper_loader_info *info, VkSurfaceKHR *surface);
++
+ #ifdef __cplusplus
+ }
+ #endif
+diff --git a/src/gallium/drivers/zink/zink_kopper_haiku.cpp b/src/gallium/drivers/zink/zink_kopper_haiku.cpp
+new file mode 100644
+index 0000000..0fa618e
+--- /dev/null
++++ b/src/gallium/drivers/zink/zink_kopper_haiku.cpp
+@@ -0,0 +1,36 @@
++#include "zink_context.h"
++#include "zink_screen.h"
++#include "zink_resource.h"
++extern "C" {
++#include "zink_kopper.h"
++}
++
++class BBitmap;
++
++
++class BitmapHook {
++public:
++	virtual ~BitmapHook() {};
++	virtual void GetSize(uint32_t &width, uint32_t &height) = 0;
++	virtual BBitmap *SetBitmap(BBitmap *bmp) = 0;
++};
++
++class VKLayerSurfaceBase {
++public:
++	virtual ~VKLayerSurfaceBase() {};
++	virtual void SetBitmapHook(BitmapHook *hook) = 0;
++};
++
++
++VkResult
++zink_kopper_create_surface_haiku(struct zink_screen *screen, struct kopper_loader_info *info, VkSurfaceKHR *surface)
++{
++	VkResult error = VKSCR(CreateHeadlessSurfaceEXT)(screen->instance, (VkHeadlessSurfaceCreateInfoEXT*)&info->bos, NULL, surface);
++	if (error != VK_SUCCESS)
++		return error;
++
++	auto haiku_surface = (VKLayerSurfaceBase*)(*surface);
++	haiku_surface->SetBitmapHook((BitmapHook*)info->bitmapHook);
++
++	return error;
++}
+diff --git a/src/gallium/drivers/zink/zink_screen.c b/src/gallium/drivers/zink/zink_screen.c
+index d05df40..361d49e 100644
+--- a/src/gallium/drivers/zink/zink_screen.c
++++ b/src/gallium/drivers/zink/zink_screen.c
+@@ -62,6 +62,10 @@
+ #endif
+ #endif
+ 
++#ifdef __HAIKU__
++#define RTLD_NOLOAD 0
++#endif
++
+ static int num_screens = 0;
+ bool zink_tracing = false;
+ 
+diff --git a/src/gallium/frontends/hgl/hgl.c b/src/gallium/frontends/hgl/hgl.c
+index e9af7b6..5f99a3b 100644
+--- a/src/gallium/frontends/hgl/hgl.c
++++ b/src/gallium/frontends/hgl/hgl.c
+@@ -7,6 +7,7 @@
+  *      Alexander von Gluck IV, kallisti5@unixzen.com
+  */
+ 
++#define GALLIUM_ZINK
+ #include "hgl_context.h"
+ 
+ #include <stdio.h>
+@@ -18,6 +19,10 @@
+ #include "util/u_inlines.h"
+ #include "state_tracker/st_context.h"
+ 
++#ifdef GALLIUM_ZINK
++#include "kopper_interface.h"
++#endif
++
+ 
+ #if MESA_DEBUG
+ #   define TRACE(x...) printf("hgl:frontend: " x)
+@@ -76,6 +81,21 @@ hgl_st_framebuffer_flush_front(struct st_context *st,
+ }
+ 
+ 
++#ifdef GALLIUM_ZINK
++static void
++stw_st_fill_private_loader_data(struct hgl_buffer *buffer, struct kopper_loader_info *out)
++{
++	VkHeadlessSurfaceCreateInfoEXT *headless = (VkHeadlessSurfaceCreateInfoEXT*)&out->bos;
++
++	headless->sType = VK_STRUCTURE_TYPE_HEADLESS_SURFACE_CREATE_INFO_EXT;
++	headless->pNext = NULL;
++	headless->flags = 0;
++	out->bitmapHook = buffer->winsysContext;
++	out->has_alpha = true;
++}
++#endif
++
++
+ static bool
+ hgl_st_framebuffer_validate_textures(struct pipe_frontend_drawable *drawable,
+ 	unsigned width, unsigned height, unsigned mask)
+@@ -115,10 +135,18 @@ hgl_st_framebuffer_validate_textures(struct pipe_frontend_drawable *drawable,
+ 				case ST_ATTACHMENT_BACK_RIGHT:
+ 					format = buffer->visual.color_format;
+ 					bind = PIPE_BIND_DISPLAY_TARGET | PIPE_BIND_RENDER_TARGET;
++#ifdef GALLIUM_ZINK
++					/* Covers the case where we have already created a drawable that
++					* then got swapped and now we have to make a new back buffer.
++					* For Zink, we just alias the front buffer in that case.
++					*/
++					if (i == ST_ATTACHMENT_BACK_LEFT && buffer->textures[ST_ATTACHMENT_FRONT_LEFT])
++						bind &= ~PIPE_BIND_DISPLAY_TARGET;
++#endif
+ 					break;
+ 				case ST_ATTACHMENT_DEPTH_STENCIL:
+ 					format = buffer->visual.depth_stencil_format;
+-					bind = PIPE_BIND_DEPTH_STENCIL;
++					bind = PIPE_BIND_DISPLAY_TARGET | PIPE_BIND_DEPTH_STENCIL;
+ 					break;
+ 				default:
+ 					format = PIPE_FORMAT_NONE;
+@@ -130,8 +158,25 @@ hgl_st_framebuffer_validate_textures(struct pipe_frontend_drawable *drawable,
+ 				templat.format = format;
+ 				templat.bind = bind;
+ 				TRACE("resource_create(%d, %d, %d)\n", i, format, bind);
+-				buffer->textures[i] = buffer->screen->resource_create(buffer->screen,
+-					&templat);
++#ifdef GALLIUM_ZINK
++				if (i < ST_ATTACHMENT_DEPTH_STENCIL && buffer->screen->resource_create_drawable) {
++					struct kopper_loader_info loader_info;
++					void *data;
++
++					if (bind & PIPE_BIND_DISPLAY_TARGET) {
++						stw_st_fill_private_loader_data(buffer, &loader_info);
++						data = &loader_info;
++					} else
++						data = buffer->textures[ST_ATTACHMENT_FRONT_LEFT];
++
++					assert(data);
++					buffer->textures[i] = buffer->screen->resource_create_drawable(buffer->screen, &templat, data);
++				} else {
++#endif
++					buffer->textures[i] = buffer->screen->resource_create(buffer->screen, &templat);
++#ifdef GALLIUM_ZINK
++				}
++#endif
+ 				if (!buffer->textures[i])
+ 					return false;
+ 			}
+diff --git a/src/gallium/frontends/hgl/hgl_context.h b/src/gallium/frontends/hgl/hgl_context.h
+index 711e63e..b994533 100644
+--- a/src/gallium/frontends/hgl/hgl_context.h
++++ b/src/gallium/frontends/hgl/hgl_context.h
+@@ -36,11 +36,6 @@ extern "C" {
+ #endif
+ 
+ 
+-#define CONTEXT_MAX 32
+-
+-typedef int64 context_id;
+-
+-
+ struct hgl_buffer
+ {
+ 	struct pipe_frontend_drawable base;
+diff --git a/src/gallium/include/kopper_interface.h b/src/gallium/include/kopper_interface.h
+index 2f938db..49645d2 100644
+--- a/src/gallium/include/kopper_interface.h
++++ b/src/gallium/include/kopper_interface.h
+@@ -70,6 +70,7 @@ struct kopper_vk_surface_create_storage {
+ 
+ struct kopper_loader_info {
+    struct kopper_vk_surface_create_storage bos;
++   void *bitmapHook;
+    int has_alpha;
+    int initial_swap_interval;
+    bool present_opaque;
+-- 
+2.43.0
+
+
+From 9c427d47807d8c563bc6b992251dc5090732f07f Mon Sep 17 00:00:00 2001
+From: Techniix <Techniix@users.noreply.github.com>
+Date: Sat, 7 Nov 2026 13:14:18 -0500
+Subject: [PATCH 4/6] egl/haiku, hgl: make pbuffers work without a window
+
+A pbuffer's hgl_buffer has no BitmapHook (winsysContext is NULL), but:
+
+- haiku_make_current() calls update_size(), which called
+  BitmapHook::GetSize() through that NULL pointer;
+- haiku_swap_buffers() went on to flush_frontbuffer() and update_size();
+- hgl_st_framebuffer_validate_textures() created the color buffers as
+  Zink drawables (kopper) and every attachment with
+  PIPE_BIND_DISPLAY_TARGET, which need a window behind them;
+- hgl_st_framebuffer_flush_front() passed the NULL hook to
+  flush_frontbuffer().
+
+Skip the size query for windowless buffers (a pbuffer's size is fixed at
+creation), make eglSwapBuffers() on a pbuffer a no-op as EGL 1.5 3.10.3
+requires, create plain render-target and depth textures when there is no
+window, and don't try to show a windowless front buffer. A pbuffer created
+without EGL_WIDTH/EGL_HEIGHT (0x0, which is valid) gets 1x1 textures, since
+the backing resources can't be empty.
+
+Carried from Quasar's tools/patches/mesa-zink/0001 (made for X547's 25.1 tree);
+it applies unchanged on 26.3 after the Zink Haiku support commit.
+
+Generated-by: LLM
+Biblioklept: this change and message were written by an AI model.
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01AVRp8mDpV9jS7UpPk2uhfF
+(cherry picked from commit 3d57ac794c7b7ae2f8b00d9f58bce93a547e64dd)
+---
+ src/egl/drivers/haiku/egl_haiku.cpp | 16 ++++++++++++++--
+ src/gallium/frontends/hgl/hgl.c     | 15 ++++++++++++++-
+ 2 files changed, 28 insertions(+), 3 deletions(-)
+
+diff --git a/src/egl/drivers/haiku/egl_haiku.cpp b/src/egl/drivers/haiku/egl_haiku.cpp
+index d6c5d20..865c634 100644
+--- a/src/egl/drivers/haiku/egl_haiku.cpp
++++ b/src/egl/drivers/haiku/egl_haiku.cpp
+@@ -159,8 +159,10 @@ haiku_create_pbuffer_surface(_EGLDisplay *disp, _EGLConfig *conf,
+       return NULL;
+    }
+ 
+-   wgl_surf->fb->newWidth = wgl_surf->base.Width;
+-   wgl_surf->fb->newHeight = wgl_surf->base.Height;
++   // EGL_WIDTH/EGL_HEIGHT default to 0, which is a valid pbuffer, but the
++   // backing textures can't be empty: give them at least one pixel.
++   wgl_surf->fb->newWidth = std::max<EGLint>(wgl_surf->base.Width, 1);
++   wgl_surf->fb->newHeight = std::max<EGLint>(wgl_surf->base.Height, 1);
+    p_atomic_inc(&wgl_surf->fb->base.stamp);
+ 
+    return &wgl_surf->base;
+@@ -190,6 +192,11 @@ haiku_destroy_surface(_EGLDisplay *disp, _EGLSurface *surf)
+ static void
+ update_size(struct hgl_buffer *buffer)
+ {
++   // A pbuffer has no window (winsysContext is NULL); its size was fixed when
++   // it was created.
++   if (buffer->winsysContext == NULL)
++      return;
++
+    uint32_t newWidth, newHeight;
+    ((BitmapHook *)buffer->winsysContext)->GetSize(newWidth, newHeight);
+    if (buffer->newWidth != newWidth || buffer->newHeight != newHeight) {
+@@ -208,6 +215,11 @@ haiku_swap_buffers(_EGLDisplay *disp, _EGLSurface *surf)
+    if (hgl_ctx == NULL)
+       return EGL_FALSE;
+ 
++   // EGL 1.5, 3.10.3: "If surface is a pixel buffer or a pixmap,
++   // eglSwapBuffers has no effect, and no error is generated."
++   if (hgl_surf->fb->winsysContext == NULL)
++      return EGL_TRUE;
++
+    struct st_context *st = hgl_ctx->ctx->st;
+    struct pipe_screen *screen = hgl_dpy->disp->fscreen->screen;
+ 
+diff --git a/src/gallium/frontends/hgl/hgl.c b/src/gallium/frontends/hgl/hgl.c
+index 5f99a3b..95dacae 100644
+--- a/src/gallium/frontends/hgl/hgl.c
++++ b/src/gallium/frontends/hgl/hgl.c
+@@ -73,6 +73,10 @@ hgl_st_framebuffer_flush_front(struct st_context *st,
+ 	if (!ptex)
+ 		return true;
+ 
++	// A pbuffer has no window to show the front buffer in.
++	if (buffer->winsysContext == NULL)
++		return true;
++
+ 	// TODO: pipe_context here??? Might be needed for hw renderers
+ 	buffer->screen->flush_frontbuffer(buffer->screen, NULL, ptex, 0, 0,
+ 		buffer->winsysContext, 0, NULL);
+@@ -108,6 +112,11 @@ hgl_st_framebuffer_validate_textures(struct pipe_frontend_drawable *drawable,
+ 
+ 	buffer = hgl_st_framebuffer(drawable);
+ 
++	/* A pbuffer (no BitmapHook) gets plain textures: nothing is ever
++	 * displayed, and a display-target or Zink drawable resource needs a
++	 * window to back it. */
++	const bool has_window = buffer->winsysContext != NULL;
++
+ 	if (buffer->width != width || buffer->height != height) {
+ 		TRACE("validate_textures: size changed: %d, %d -> %d, %d\n",
+ 			buffer->width, buffer->height, width, height);
+@@ -143,10 +152,14 @@ hgl_st_framebuffer_validate_textures(struct pipe_frontend_drawable *drawable,
+ 					if (i == ST_ATTACHMENT_BACK_LEFT && buffer->textures[ST_ATTACHMENT_FRONT_LEFT])
+ 						bind &= ~PIPE_BIND_DISPLAY_TARGET;
+ #endif
++					if (!has_window)
++						bind &= ~PIPE_BIND_DISPLAY_TARGET;
+ 					break;
+ 				case ST_ATTACHMENT_DEPTH_STENCIL:
+ 					format = buffer->visual.depth_stencil_format;
+ 					bind = PIPE_BIND_DISPLAY_TARGET | PIPE_BIND_DEPTH_STENCIL;
++					if (!has_window)
++						bind &= ~PIPE_BIND_DISPLAY_TARGET;
+ 					break;
+ 				default:
+ 					format = PIPE_FORMAT_NONE;
+@@ -159,7 +172,7 @@ hgl_st_framebuffer_validate_textures(struct pipe_frontend_drawable *drawable,
+ 				templat.bind = bind;
+ 				TRACE("resource_create(%d, %d, %d)\n", i, format, bind);
+ #ifdef GALLIUM_ZINK
+-				if (i < ST_ATTACHMENT_DEPTH_STENCIL && buffer->screen->resource_create_drawable) {
++				if (has_window && i < ST_ATTACHMENT_DEPTH_STENCIL && buffer->screen->resource_create_drawable) {
+ 					struct kopper_loader_info loader_info;
+ 					void *data;
+ 
+-- 
+2.43.0
+
+
+From a28cf4b379d1f233fafe8f776b29c5ccaf8752cd Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Fri, 20 Nov 2026 08:05:02 -0500
+Subject: [PATCH 5/6] zink: link xmlconfig through driver_zink
+
+The first GCC build of Zink from this tree on Renga (GCC 15.3) compiled
+all 942 steps and failed only at the final link of libEGL_mesa.so:
+
+  zink_screen.c:3537: undefined reference to `driParseConfigFiles'
+  zink_screen.c:3539: undefined reference to `driQueryOptionb'
+
+zink_internal_create_screen() reads driconf options, but libzink does
+not declare the dependency. On the DRI platforms the frontend brings
+libxmlconfig in (src/egl/meson.build adds idep_xmlconfig only in its DRI
+branch). Haiku's EGL driver links Zink directly, without a DRI frontend.
+Add idep_xmlconfig to driver_zink, so every user of Zink links what Zink
+calls.
+
+Not yet built on Renga.
+
+Generated-by: LLM
+Biblioklept: this commit message was written by an AI model.
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01AVRp8mDpV9jS7UpPk2uhfF
+(cherry picked from commit c7aca8ab7dc7c56ab476941e46f54d95bc036d22)
+---
+ src/gallium/drivers/zink/meson.build | 4 ++++
+ 1 file changed, 4 insertions(+)
+
+diff --git a/src/gallium/drivers/zink/meson.build b/src/gallium/drivers/zink/meson.build
+index 34a4dc5..61e354f 100644
+--- a/src/gallium/drivers/zink/meson.build
++++ b/src/gallium/drivers/zink/meson.build
+@@ -118,6 +118,10 @@ driver_zink = declare_dependency(
+   compile_args : '-DGALLIUM_ZINK',
+   link_with : zink_deps,
+   link_args : zink_link_args,
++  # zink_screen.c reads driconf (driParseConfigFiles, driQueryOptionb).
++  # Other loaders link xmlconfig through the DRI frontend; Haiku's EGL
++  # driver links Zink without one.
++  dependencies : idep_xmlconfig,
+ )
+ 
+ if with_tests
+-- 
+2.43.0
+
+
+From abe439d3c6a40a33da67f68bafccf1a8c1200707 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Fri, 20 Nov 2026 16:59:44 -0500
+Subject: [PATCH 6/6] egl/haiku: Zink when there is a Vulkan GPU, else the
+ software rasteriser
+
+The Haiku EGL driver created a Zink screen unconditionally, which made
+sense while Zink came from a Quasar-only build. Renga now packages a
+system Mesa (RengaPorts mesa 26.2.2: llvmpipe, lavapipe, glvnd, EGL). The
+clean arrangement is one system Mesa whose EGL uses Zink on whatever
+Vulkan GPU driver is installed (NVK through Quasar on NVIDIA) and
+llvmpipe everywhere else, rather than two libEGL_mesa vendors, one per
+package.
+
+haiku_create_screen():
+- tries zink_create_screen() first. Zink refuses CPU Vulkan devices
+  (lavapipe) unless asked for one, so a machine without a GPU driver
+  falls through;
+- otherwise uses sw_screen_create() (llvmpipe or softpipe, whichever is
+  built);
+- honours GALLIUM_DRIVER=llvmpipe/softpipe and LIBGL_ALWAYS_SOFTWARE
+  for the software path, as on other platforms;
+- logs at info level when it falls back.
+
+Each branch is compiled only when its driver is built: Quasar's Zink-only
+build still fails eglInitialize without a GPU, as before.
+
+hgl.c: the GALLIUM_ZINK block that aliases the back buffer to the front
+drawable now also requires the screen to have resource_create_drawable,
+which only Zink has. A software screen in the same build keeps a display
+target per buffer, as upstream hgl does.
+
+Checked: tools/crosscheck/mesa.sh for both files, and for egl_haiku.cpp
+also with GALLIUM_ZINK and GALLIUM_LLVMPIPE both defined. Not built with
+GCC or run.
+
+Generated-by: LLM
+Biblioklept: this change and message were written by an AI model.
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01AVRp8mDpV9jS7UpPk2uhfF
+(cherry picked from commit a1514e46ceec783b057712e9a69d45685361e0ba)
+---
+ src/egl/drivers/haiku/egl_haiku.cpp | 39 ++++++++++++++++++++++++++---
+ src/gallium/frontends/hgl/hgl.c     |  5 +++-
+ 2 files changed, 39 insertions(+), 5 deletions(-)
+
+diff --git a/src/egl/drivers/haiku/egl_haiku.cpp b/src/egl/drivers/haiku/egl_haiku.cpp
+index 865c634..ab38f0c 100644
+--- a/src/egl/drivers/haiku/egl_haiku.cpp
++++ b/src/egl/drivers/haiku/egl_haiku.cpp
+@@ -26,6 +26,7 @@
+ #include <errno.h>
+ #include <stdint.h>
+ #include <stdio.h>
++#include <string.h>
+ 
+ #include <algorithm>
+ 
+@@ -44,6 +45,7 @@
+ #include "pipe/p_defines.h"
+ #include "state_tracker/st_context.h"
+ #include "util/u_atomic.h"
++#include "util/u_debug.h"
+ #include "mesa/glapi/glapi/glapi.h"
+ 
+ #include "hgl/hgl_sw_winsys.h"
+@@ -342,6 +344,37 @@ haiku_display_destroy(_EGLDisplay *disp)
+    free(hgl_dpy);
+ }
+ 
++/* The Gallium screen behind EGL on Haiku/Renga: Zink on the GPU's Vulkan
++ * driver when there is one (NVK on NVIDIA, through Quasar), otherwise the
++ * software rasteriser this Mesa was built with. Zink refuses CPU Vulkan
++ * devices (lavapipe) unless asked for one, so a machine without a GPU
++ * driver falls through to llvmpipe. GALLIUM_DRIVER (llvmpipe, softpipe)
++ * and LIBGL_ALWAYS_SOFTWARE choose the software path explicitly, as on
++ * other platforms. One build serves both, so a system Mesa can carry Zink. */
++static struct pipe_screen *
++haiku_create_screen(struct sw_winsys *winsys)
++{
++   const char *driver = debug_get_option("GALLIUM_DRIVER", "");
++   const bool software = debug_get_bool_option("LIBGL_ALWAYS_SOFTWARE", false) ||
++      (driver[0] != '\0' && strcmp(driver, "zink") != 0);
++
++#if defined(GALLIUM_ZINK)
++   if (!software) {
++      struct pipe_screen *screen = zink_create_screen(winsys, NULL);
++      if (screen != NULL)
++         return screen;
++      _eglLog(_EGL_INFO, "Haiku EGL: Zink found no Vulkan GPU, "
++              "using a software rasteriser");
++   }
++#endif
++#if defined(GALLIUM_LLVMPIPE) || defined(GALLIUM_SOFTPIPE)
++   return sw_screen_create(winsys);
++#else
++   (void)software;
++   return NULL;
++#endif
++}
++
+ static EGLBoolean
+ haiku_initialize_impl(_EGLDisplay *disp, void *platformDisplay)
+ {
+@@ -356,14 +389,12 @@ haiku_initialize_impl(_EGLDisplay *disp, void *platformDisplay)
+    disp->DriverData = (void *)hgl_dpy;
+ 
+    struct sw_winsys *winsys = hgl_create_sw_winsys();
+-   // Renga: OpenGL is Zink on the GPU's Vulkan driver (NVK), never a
+-   // software rasteriser.
+-   struct pipe_screen *screen = zink_create_screen(winsys, NULL);
++   struct pipe_screen *screen = haiku_create_screen(winsys);
+    if (screen == NULL) {
+       winsys->destroy(winsys);
+       free(hgl_dpy);
+       disp->DriverData = NULL;
+-      return _eglError(EGL_NOT_INITIALIZED, "eglInitialize: no Zink screen");
++      return _eglError(EGL_NOT_INITIALIZED, "eglInitialize: no Gallium screen");
+    }
+    hgl_dpy->disp = hgl_create_display(screen);
+ 
+diff --git a/src/gallium/frontends/hgl/hgl.c b/src/gallium/frontends/hgl/hgl.c
+index 95dacae..3b2dbcf 100644
+--- a/src/gallium/frontends/hgl/hgl.c
++++ b/src/gallium/frontends/hgl/hgl.c
+@@ -148,8 +148,11 @@ hgl_st_framebuffer_validate_textures(struct pipe_frontend_drawable *drawable,
+ 					/* Covers the case where we have already created a drawable that
+ 					* then got swapped and now we have to make a new back buffer.
+ 					* For Zink, we just alias the front buffer in that case.
++					* Only Zink (resource_create_drawable) works this way; the
++					* software rasterisers keep a display target per buffer.
+ 					*/
+-					if (i == ST_ATTACHMENT_BACK_LEFT && buffer->textures[ST_ATTACHMENT_FRONT_LEFT])
++					if (i == ST_ATTACHMENT_BACK_LEFT && buffer->textures[ST_ATTACHMENT_FRONT_LEFT]
++						&& buffer->screen->resource_create_drawable)
+ 						bind &= ~PIPE_BIND_DISPLAY_TARGET;
+ #endif
+ 					if (!has_window)
+-- 
+2.43.0
+
+
