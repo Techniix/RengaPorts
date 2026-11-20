@@ -12,7 +12,7 @@ are the Haiku back ends. Replaces HaikuPorts' libsdl3 on Renga."
 HOMEPAGE="https://www.libsdl.org/"
 COPYRIGHT="1997-2026 Sam Lantinga"
 LICENSE="Zlib"
-REVISION="104"
+REVISION="105"
 # Revisions from 100 up: Renga builds of HaikuPorts packages keep the
 # version and take a revision above any HaikuPorts revision, so pkgman
 # replaces HaikuPorts' build (README, "Replacing HaikuPorts packages").
@@ -29,6 +29,12 @@ REVISION="104"
 #   drivers (Switch Pro Controller gyro and rumble, DualSense, ...).
 # - The BJoystick back end stays but is off unless SDL_JOYSTICK_HAIKU=1, so
 #   pads are not listed twice.
+# - (Third Renga patch, revision 105) Xbox and 8BitDo pads stay on evdev:
+#   SDL_JOYSTICK_HIDAPI_XBOX and SDL_JOYSTICK_HIDAPI_8BITDO default to 0
+#   (environment variables and SDL_SetHint() still win). SDL_Init(GAMEPAD)
+#   took about 35 s with an 8BitDo Ultimate 2C while those drivers probed
+#   its hidraw node; Renga's usb_hid now also gives up HID requests after
+#   250 ms.
 # - (Second Renga patch, revision 103) SDL's BApplication starts and stops
 #   only under SDL's control: the start and stop are locked, SDL_InitBeApp()
 #   waits for the application's ReadyToRun(), and a B_QUIT_REQUESTED from

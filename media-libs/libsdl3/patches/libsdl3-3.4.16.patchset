@@ -1704,3 +1704,50 @@ index eee7eb8..934b6d2 100644
 -- 
 2.43.0
 
+From 3b29995dfee34e2f138d20a0a3e10e8801e0c6c5 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Fri, 20 Nov 2026 08:08:47 -0500
+Subject: [PATCH] Renga: Xbox and 8BitDo pads stay on evdev; HIDAPI drivers for
+ them off by default
+
+SDL_Init(GAMEPAD) took about 35 s on a Renga machine with an 8BitDo
+Ultimate 2C: SDL's HIDAPI Xbox and 8BitDo drivers opened the pad's hidraw
+node and probed it with HID requests, each of which the kernel let wait
+up to 5 s. The Linux evdev back end already serves these pads completely
+(the kernel's xinput and usb_hid drivers), so on Renga the
+SDL_JOYSTICK_HIDAPI_XBOX and SDL_JOYSTICK_HIDAPI_8BITDO hints default to
+0. HIDAPI stays on for what evdev lacks (Switch and PlayStation gyro,
+rumble and lights). The environment variables and SDL_SetHint() still
+turn the drivers on (default priority only). The kernel side (hidraw
+report requests time out after 250 ms, strings read once) is Renga
+commit in usb_hid.
+---
+ src/joystick/hidapi/SDL_hidapijoystick.c | 12 ++++++++++++
+ 1 file changed, 12 insertions(+)
+
+diff --git a/src/joystick/hidapi/SDL_hidapijoystick.c b/src/joystick/hidapi/SDL_hidapijoystick.c
+index 0389503..f879ef3 100644
+--- a/src/joystick/hidapi/SDL_hidapijoystick.c
++++ b/src/joystick/hidapi/SDL_hidapijoystick.c
+@@ -584,6 +584,18 @@ static bool HIDAPI_JoystickInit(void)
+         return SDL_SetError("Couldn't initialize hidapi");
+     }
+ 
++#ifdef SDL_HIDAPI_RENGA
++    /* Renga: Xbox and 8BitDo pads stay on the Linux evdev back end, which
++       serves them completely (the kernel's xinput and usb_hid drivers);
++       HIDAPI is for what evdev lacks (Switch and PlayStation gyro,
++       rumble and lights). Through HIDAPI the Xbox and 8BitDo drivers
++       probed an 8BitDo Ultimate 2C for half a minute at SDL_Init(). These
++       are defaults: the environment variables or SDL_SetHint() still
++       turn them on. */
++    SDL_SetHintWithPriority(SDL_HINT_JOYSTICK_HIDAPI_XBOX, "0", SDL_HINT_DEFAULT);
++    SDL_SetHintWithPriority(SDL_HINT_JOYSTICK_HIDAPI_8BITDO, "0", SDL_HINT_DEFAULT);
++#endif
++
+     for (i = 0; i < SDL_arraysize(SDL_HIDAPI_drivers); ++i) {
+         SDL_HIDAPI_DeviceDriver *driver = SDL_HIDAPI_drivers[i];
+         driver->RegisterHints(SDL_HIDAPIDriverHintChanged, driver);
+-- 
+2.43.0
+
