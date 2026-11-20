@@ -1,0 +1,16 @@
+diff --git a/Source/WebCore/platform/haiku/UserAgentHaiku.cpp b/Source/WebCore/platform/haiku/UserAgentHaiku.cpp
+index 56500e6..90b493e 100644
+--- a/Source/WebCore/platform/haiku/UserAgentHaiku.cpp
++++ b/Source/WebCore/platform/haiku/UserAgentHaiku.cpp
+@@ -58,7 +58,10 @@ static String standardUserAgentStatic()
+ {
+     // Version/X is mandatory *before* Safari/X to be a valid Safari UA. See
+     // https://bugs.webkit.org/show_bug.cgi?id=133403 for details.
+-    static NeverDestroyed<String> uaStatic(makeString("Mozilla/5.0 (Macintosh; Intel "_s, getSystemSoftwareName(), '/', getSystemSoftwareVersion(), ") AppleWebKit/"_s, versionForUAString(), " (KHTML, like Gecko) "_s, "Version/17.0 Safari/"_s, versionForUAString()));
++    // Renga: Version/26.0 (Safari 26) instead of 17.0. Sites that check
++    // the Safari version served WebPositive their pages for old browsers,
++    // or none. Only the version changes, so sniffers that worked keep working.
++    static NeverDestroyed<String> uaStatic(makeString("Mozilla/5.0 (Macintosh; Intel "_s, getSystemSoftwareName(), '/', getSystemSoftwareVersion(), ") AppleWebKit/"_s, versionForUAString(), " (KHTML, like Gecko) "_s, "Version/26.0 Safari/"_s, versionForUAString()));
+     return uaStatic;
+ }
+ 

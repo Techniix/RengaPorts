@@ -1,30 +1,45 @@
 # Renga build of HaikuWebKit 1.10.0: the HaikuPorts recipe (master,
-# revision 2) with one patch for HTML5 media (Renga roadmap F-57 item 4).
+# revision 2) with two Renga patches (roadmap F-57, batch 8).
 #
-# HaikuWebKit plays <video> and <audio> through the Media Kit (BMediaFile,
-# BMediaTrack, BSoundPlayer), so Renga's FFmpeg plug-in work (codecs,
-# seeking, HLS) reaches web pages without WebKit changes; that part is in
-# the Renga tree and tested there (media_html5_test). This patch adds what
-# only WebKit can do: a video without an audio track used to stand still,
-# because the audio track's sound player was the only clock; it now runs on
-# a silent sound player's clock, and duration() reports the video's.
+# haikuwebkit-1.10.0-renga-html5-sound.patch, HTML5 <audio>/<video> sound
+# (MediaPlayerPrivateHaiku). Found with media_html5_test in the Renga
+# harness using the packaged 1.10.0 binary: WebM sound with gaps (about
+# 90 % of 10 ms blocks silent), MP4 sound missing, while the Media Kit part
+# of the same path plays both cleanly. Causes in 1.10.0's player:
+# - the sound player's real-time callback locked m_mediaLock, which the
+#   video thread held while decoding a frame (tens of ms on a slow or
+#   emulated CPU), so the callback missed its deadline;
+# - the callback decoded one chunk with ReadFrames() whatever the buffer's
+#   size: a larger buffer kept old data in its tail, a smaller one was
+#   overrun.
+# Now audio is decoded by an "audio decoder" thread into a half-second
+# ring; the callback only copies exactly its buffer's size out of it (a
+# short ring lock, never held while decoding) and plays silence for
+# what is not decoded yet; the clock is the audio actually played. Each
+# track has its own decode lock; video frames are decoded into a second
+# bitmap and swapped in under a frame lock, which paint() takes. After
+# the sound ends, the video goes on with the system clock. Also:
+# duration() is the longer track (a video without an audio track had
+# none), seekToTarget() stops both decoders, restarts the ring at the
+# audio track's new position, and returns its promise (it returned
+# nothing: undefined behaviour).
+# Replaces haikuwebkit-1.10.0-renga-video-only.patch (revision 100, never
+# built), which was written against haikuwebkit's "haiku" branch and does
+# not apply to the 1.10.0 tarball (one hunk fails); 1.10.0 already runs a
+# video without audio on the system clock, and its duration fix is in the
+# new patch.
 #
-# Status: written against MediaPlayerPrivateHaiku.cpp of haikuwebkit's
-# "haiku" branch; not built or run yet (HaikuWebKit needs a Haiku build
-# host). Build with HaikuPorter on Renga and check with a muted video page.
+# haikuwebkit-1.10.0-renga-user-agent.patch: Version/26.0 (Safari 26)
+# instead of 17.0 in the user agent, nothing else changed.
 #
-# Open (found 2026-11-11 with media_html5_test in the Renga harness, using
-# the packaged 1.10.0 binary): WebM and MP4 clips play (the "playing"
-# event fires, the frames show), but their sound has gaps (WebM: about
-# 90 % of 10 ms blocks silent) or is missing (MP4). The Media Kit part of
-# the same path (BMediaFile on the URL, the decoded format handed to a
-# BSoundPlayer, one ReadFrames() per callback) plays both clips cleanly in
-# the same test, so the cause is in MediaPlayerPrivateHaiku: it decodes the
-# video frame inside the sound player's callback (a real-time thread),
-# which an emulated CPU does not finish in time, and it reads one decoded
-# chunk per callback whatever the buffer size. The fix is a video thread
-# of its own and filling each audio buffer completely; not written yet
-# because it cannot be built or measured without a Haiku build host.
+# Status (2026-11-20): Implemented, not tested. Both patches apply to the
+# 1.10.0 tarball; MediaPlayerPrivateHaiku.cpp compiles with Renga's
+# x86_64-unknown-haiku cross-compiler (GCC 13.3) against Renga's
+# haiku_devel and HaikuPorts' devel packages on the Linux build host. The
+# whole engine was not built there: WebCore alone is about 690 unified
+# objects, several hours on the 2-core host. Build with HaikuPorter on
+# Renga, then check with media_html5_test (renga-raw) and a page with a
+# WebM and an MP4 clip.
 SUMMARY="Open source web browser engine"
 DESCRIPTION="
 WebKit is an open source web browser engine. WebKit is also the name of the \
@@ -36,13 +51,16 @@ COPYRIGHT="1998-2026 Apple Inc., Google Inc., Sony, Samsung, Igalia, et al"
 LICENSE="GNU LGPL v2
 	GNU LGPL v2.1
 	MIT"
-REVISION="100"
+REVISION="101"
 # Revisions from 100 up for Renga builds of HaikuPorts packages (README).
 
 SOURCE_URI="https://codeberg.org/haiku/haikuwebkit/releases/download/HaikuWebKit-$portVersion/haikuwebkit-$portVersion.tar.gz"
 CHECKSUM_SHA256="5852128e3cba2b411e1a006a9c54cca74b96ca51fd9435c3cbb9b732d02fc556"
 SOURCE_DIR="haikuwebkit"
-PATCHES="haikuwebkit-$portVersion-renga-video-only.patch"
+PATCHES="
+	haikuwebkit-$portVersion-renga-html5-sound.patch
+	haikuwebkit-$portVersion-renga-user-agent.patch
+	"
 
 ARCHITECTURES="all !x86_gcc2"
 SECONDARY_ARCHITECTURES="?x86"

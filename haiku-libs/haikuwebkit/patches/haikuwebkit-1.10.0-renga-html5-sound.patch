@@ -1,0 +1,536 @@
+diff --git a/Source/WebCore/platform/graphics/haiku/MediaPlayerPrivateHaiku.cpp b/Source/WebCore/platform/graphics/haiku/MediaPlayerPrivateHaiku.cpp
+index 5125b9c..f1590b7 100644
+--- a/Source/WebCore/platform/graphics/haiku/MediaPlayerPrivateHaiku.cpp
++++ b/Source/WebCore/platform/graphics/haiku/MediaPlayerPrivateHaiku.cpp
+@@ -26,6 +26,7 @@
+ #include "NotImplemented.h"
+ #include "wtf/text/CString.h"
+ #include "wtf/NeverDestroyed.h"
++#include <wtf/NativePromise.h>
+ 
+ #include <support/Locker.h>
+ #include <Bitmap.h>
+@@ -37,7 +38,10 @@
+ #include <SoundPlayer.h>
+ #include <View.h>
+ #include <OS.h>
++#include <Autolock.h>
++#include <algorithm>
+ #include <cmath>
++#include <string.h>
+ 
+ 
+ namespace WebCore {
+@@ -99,6 +103,7 @@ MediaPlayerPrivate::~MediaPlayerPrivate()
+ 
+     cancelLoad();
+     delete m_frameBuffer;
++    delete m_decodeBuffer;
+     m_mediaLock.Unlock();
+ }
+ 
+@@ -141,6 +146,12 @@ void MediaPlayerPrivate::cancelLoad()
+         m_videoThread = -1;
+     }
+ 
++    if (m_audioThread >= 0) {
++        status_t status;
++        wait_for_thread(m_audioThread, &status);
++        m_audioThread = -1;
++    }
++
+     m_mediaLock.Lock();
+     if (m_soundPlayer)
+         m_soundPlayer->Stop();
+@@ -151,6 +162,15 @@ void MediaPlayerPrivate::cancelLoad()
+     m_mediaFile = nullptr;
+     m_audioTrack = nullptr;
+     m_videoTrack = nullptr;
++    m_videoEOF = false;
++    m_ring.reset();
++    m_ringSize = 0;
++    m_chunk.reset();
++    m_ringWritten = 0;
++    m_ringRead = 0;
++    m_framesPlayed = 0;
++    m_audioEOF = false;
++    m_endReported = false;
+     m_mediaLock.Unlock();
+ }
+ 
+@@ -160,32 +180,161 @@ void MediaPlayerPrivate::prepareToPlay()
+     // TODO should we seek the tracks to 0? reset m_currentTime? other things?
+ }
+ 
++/*!	Renga: the sound player's real-time callback. It used to lock
++	m_mediaLock (held by the video thread while it decoded a frame, which
++	an emulated or busy CPU does not finish within one buffer) and decode
++	one chunk with ReadFrames() whatever the buffer's size, which left the
++	rest of a larger buffer as it was and overran a smaller one. Now it
++	copies exactly \a size bytes from the decoded ring, and plays silence
++	for what the decoder has not delivered yet.
++*/
+ void MediaPlayerPrivate::playCallback(void* cookie, void* buffer,
+-    size_t /*size*/, const media_raw_audio_format& /*format*/)
++    size_t size, const media_raw_audio_format& format)
+ {
+     MediaPlayerPrivate* player = (MediaPlayerPrivate*)cookie;
++    uint8_t* out = (uint8_t*)buffer;
++    size_t copied = 0;
++
++    if (player->m_ringLock.Lock()) {
++        if (player->m_ring && player->m_frameSize > 0) {
++            uint64_t written = player->m_ringWritten.load(std::memory_order_acquire);
++            uint64_t read = player->m_ringRead.load(std::memory_order_relaxed);
++            size_t available = (size_t)(written - read);
++            copied = std::min(available, size);
++            copied -= copied % player->m_frameSize;
++
++            size_t offset = (size_t)(read % player->m_ringSize);
++            size_t first = std::min(copied, player->m_ringSize - offset);
++            memcpy(out, player->m_ring.get() + offset, first);
++            if (copied > first)
++                memcpy(out + first, player->m_ring.get(), copied - first);
++            player->m_ringRead.store(read + copied, std::memory_order_release);
++
++            player->m_framesPlayed += copied / player->m_frameSize;
++            if (player->m_frameRate > 0) {
++                player->m_currentTime = (player->m_audioStartTime
++                    + player->m_framesPlayed * 1000000.0 / player->m_frameRate)
++                    / 1000000.f;
++            }
++        }
++        player->m_ringLock.Unlock();
++    }
+ 
+-    if (!player->m_mediaLock.Lock())
+-        return;
+-
+-    if (player->m_audioTrack) {
+-        player->m_currentTime = player->m_audioTrack->CurrentTime() / 1000000.f;
++    if (copied < size) {
++        // Silence for the rest; unsigned 8-bit samples are silent at 0x80.
++        memset(out + copied, format.format == media_raw_audio_format::B_AUDIO_UCHAR
++            ? 0x80 : 0, size - copied);
++    }
+ 
+-        int64 size64;
+-        if (player->m_audioTrack->ReadFrames(buffer, &size64) != B_OK)
+-        {
++    if (copied == 0 && player->m_audioEOF && player->AudioDrained()
++        && !player->m_endReported.exchange(true)) {
++        if (player->m_audioTrack)
+             player->m_currentTime = player->m_audioTrack->Duration() / 1000000.f;
+-            player->m_soundPlayer->Stop(false);
++        player->m_soundPlayer->Stop(false);
++
++        callOnMainThread([p = WeakPtr(player)] {
++            if (p)
++                p->m_player.timeChanged();
++        });
++    }
++}
++
++
++bool MediaPlayerPrivate::AudioDrained() const
++{
++    return m_ringWritten.load(std::memory_order_acquire)
++        == m_ringRead.load(std::memory_order_acquire);
++}
+ 
+-            callOnMainThread([p = WeakPtr(player)] {
+-                if (p)
+-                    p->m_player.timeChanged();
+-            });
+ 
+-            player->m_audioTrack = nullptr;
++/*!	Called by IdentifyTracks() with the audio track's decoded format. */
++void MediaPlayerPrivate::SetUpAudio(const media_format& format)
++{
++    const media_raw_audio_format& raw = format.u.raw_audio;
++    m_sampleFormat = raw.format;
++    m_frameSize = (raw.format & 0xf) * raw.channel_count;
++    m_frameRate = raw.frame_rate;
++    // ReadFrames() delivers at most one decoded buffer of the negotiated
++    // size; twice that leaves room should a decoder go over it.
++    m_chunkSize = raw.buffer_size > 0 ? raw.buffer_size : 65536;
++    m_chunk.reset(new (std::nothrow) uint8_t[m_chunkSize * 2]);
++    // Half a second of sound, and at least four decoded buffers.
++    size_t ringSize = m_frameSize * (size_t)(m_frameRate / 2);
++    ringSize = std::max(ringSize, m_chunkSize * 4);
++    if (m_frameSize > 0)
++        ringSize -= ringSize % m_frameSize;
++    m_ring.reset(new (std::nothrow) uint8_t[ringSize]);
++    m_ringSize = m_ring && m_chunk && m_frameSize > 0 ? ringSize : 0;
++    if (!m_ringSize)
++        m_ring.reset();
++    m_ringWritten = 0;
++    m_ringRead = 0;
++    m_framesPlayed = 0;
++    m_audioStartTime = 0;
++    m_audioEOF = false;
++    m_endReported = false;
++
++    if (m_ringSize) {
++        m_audioThread = spawn_thread(audioThread, "audio decoder",
++            B_URGENT_DISPLAY_PRIORITY, this);
++        if (m_audioThread >= 0)
++            resume_thread(m_audioThread);
++    }
++}
++
++
++/*!	Empties the ring and restarts the audio clock at \a mediaTime. Called
++	with m_audioDecodeLock held, so the decoder is not writing.
++*/
++void MediaPlayerPrivate::ResetAudio(bigtime_t mediaTime)
++{
++    BAutolock ring(m_ringLock);
++    m_ringRead.store(m_ringWritten.load());
++    m_framesPlayed = 0;
++    m_audioStartTime = mediaTime;
++    m_audioEOF = false;
++    m_endReported = false;
++}
++
++
++status_t MediaPlayerPrivate::audioThread(void* cookie)
++{
++    MediaPlayerPrivate* player = (MediaPlayerPrivate*)cookie;
++
++    while (!player->m_abort) {
++        uint64_t written = player->m_ringWritten.load(std::memory_order_relaxed);
++        uint64_t read = player->m_ringRead.load(std::memory_order_acquire);
++        size_t space = player->m_ringSize - (size_t)(written - read);
++        if (player->m_audioEOF || space < player->m_chunkSize * 2) {
++            snooze(5000);
++            continue;
+         }
++
++        BAutolock decode(player->m_audioDecodeLock);
++        if (!player->m_audioTrack || player->m_abort)
++            break;
++
++        int64 frames = 0;
++        if (player->m_audioTrack->ReadFrames(player->m_chunk.get(), &frames) != B_OK
++            || frames <= 0) {
++            player->m_audioEOF = true;
++            continue;
++        }
++
++        size_t bytes = std::min((size_t)frames * player->m_frameSize,
++            player->m_chunkSize * 2);
++        // ResetAudio() may have moved the read position meanwhile; it
++        // only moves it up to what was written, so this is still free.
++        written = player->m_ringWritten.load(std::memory_order_relaxed);
++        size_t offset = (size_t)(written % player->m_ringSize);
++        size_t first = std::min(bytes, player->m_ringSize - offset);
++        memcpy(player->m_ring.get() + offset, player->m_chunk.get(), first);
++        if (bytes > first)
++            memcpy(player->m_ring.get(), player->m_chunk.get() + first, bytes - first);
++        player->m_ringWritten.store(written + bytes, std::memory_order_release);
+     }
+-    player->m_mediaLock.Unlock();
++
++    return B_OK;
+ }
+ 
+ 
+@@ -220,12 +369,18 @@ status_t MediaPlayerPrivate::loadingThread(void* cookie)
+     return B_OK;
+ }
+ 
++/*!	Renga: decodes under m_videoDecodeLock only (the audio callback no longer
++	waits for it) into m_decodeBuffer, then swaps that in for paint(). The
++	clock is the audio actually played while there is sound, and the system
++	time after the sound ended or when there is no audio track.
++*/
+ status_t MediaPlayerPrivate::videoThread(void* cookie)
+ {
+     MediaPlayerPrivate* player = (MediaPlayerPrivate*)cookie;
+     bigtime_t startTime = system_time();
+     bigtime_t startMediaTime = 0;
+     float lastObservedTime = 0;
++    bool audioClock = false;
+ 
+     while (!player->m_abort) {
+         if (player->m_paused) {
+@@ -236,44 +391,57 @@ status_t MediaPlayerPrivate::videoThread(void* cookie)
+             continue;
+         }
+ 
+-        if (!player->m_mediaLock.Lock())
++        if (!player->m_videoTrack || player->m_videoEOF) {
++            snooze(10000);
+             continue;
++        }
+ 
+-        if (player->m_videoTrack) {
+-            // Detect seek or external time update
+-            if (std::abs(player->m_currentTime - lastObservedTime) > 0.5f) {
+-                startTime = system_time();
+-                startMediaTime = (bigtime_t)(player->m_currentTime * 1000000);
+-            }
+-
+-            bigtime_t videoTime = player->m_videoTrack->CurrentTime();
+-            bigtime_t audioTime;
++        bool useAudio = player->m_audioTrack && player->m_ringSize
++            && !(player->m_audioEOF && player->AudioDrained());
++        if (useAudio != audioClock) {
++            audioClock = useAudio;
++            startTime = system_time();
++            startMediaTime = (bigtime_t)(player->m_currentTime * 1000000);
++        }
+ 
+-            if (player->m_audioTrack) {
+-                audioTime = player->m_audioTrack->CurrentTime();
+-            } else {
+-                audioTime = startMediaTime + (system_time() - startTime);
+-            }
++        // Detect seek or external time update
++        if (std::abs(player->m_currentTime - lastObservedTime) > 0.5f) {
++            startTime = system_time();
++            startMediaTime = (bigtime_t)(player->m_currentTime * 1000000);
++        }
+ 
+-            player->m_currentTime = audioTime / 1000000.f;
+-            lastObservedTime = player->m_currentTime;
++        bigtime_t clockTime;
++        if (audioClock)
++            clockTime = (bigtime_t)(player->m_currentTime * 1000000);
++        else {
++            clockTime = startMediaTime + (system_time() - startTime);
++            player->m_currentTime = clockTime / 1000000.f;
++        }
++        lastObservedTime = player->m_currentTime;
+ 
+-            if (videoTime < audioTime) {
++        bool decoded = false;
++        {
++            BAutolock decode(player->m_videoDecodeLock);
++            if (player->m_videoTrack && player->m_decodeBuffer
++                && player->m_videoTrack->CurrentTime() < clockTime) {
+                 int64 count;
+-                if (player->m_videoTrack->ReadFrames(player->m_frameBuffer->Bits(), &count) == B_OK) {
+-                    callOnMainThread([player = WeakPtr(player)] {
+-                        if (player)
+-                            player->m_player.repaint();
+-                    });
+-                } else {
+-                    player->m_videoTrack = nullptr;
+-                }
+-            } else {
+-                snooze(5000);
++                if (player->m_videoTrack->ReadFrames(player->m_decodeBuffer->Bits(), &count) == B_OK) {
++                    BAutolock frame(player->m_frameLock);
++                    std::swap(player->m_frameBuffer, player->m_decodeBuffer);
++                    decoded = true;
++                } else
++                    player->m_videoEOF = true;
+             }
+         }
+-        player->m_mediaLock.Unlock();
+-        snooze(1000);
++
++        if (decoded) {
++            callOnMainThread([player = WeakPtr(player)] {
++                if (player)
++                    player->m_player.repaint();
++            });
++            snooze(1000);
++        } else
++            snooze(5000);
+     }
+ 
+     return B_OK;
+@@ -322,10 +490,16 @@ void MediaPlayerPrivate::setPageIsVisible(bool)
+ 
+ WTF::MediaTime MediaPlayerPrivate::duration() const
+ {
+-    // TODO handle the case where there is a video, but no audio track.
+-    if (!m_audioTrack)
++    // Renga: the longer of the two tracks, so a video without an audio
++    // track has a duration too (it reported none and did not advance).
++    bigtime_t duration = 0;
++    if (m_audioTrack)
++        duration = m_audioTrack->Duration();
++    if (m_videoTrack)
++        duration = std::max(duration, m_videoTrack->Duration());
++    if (duration <= 0)
+         return WTF::MediaTime();
+-    return WTF::MediaTime::createWithDouble(m_audioTrack->Duration() / 1000000.f);
++    return WTF::MediaTime::createWithDouble(duration / 1000000.0);
+ }
+ 
+ WTF::MediaTime MediaPlayerPrivate::currentTime() const
+@@ -336,25 +510,48 @@ WTF::MediaTime MediaPlayerPrivate::currentTime() const
+ Ref<MediaTimePromise> MediaPlayerPrivate::seekToTarget(const SeekTarget& time)
+ {
+     m_mediaLock.Lock();
+-    bigtime_t newTime = (bigtime_t)(time.time.toDouble() * 1000000);
+-    if (m_videoTrack)
+-        m_videoTrack->SeekToTime(&newTime);
+-    if (m_audioTrack)
+-        m_audioTrack->SeekToTime(&newTime);
++    bigtime_t target = (bigtime_t)(time.time.toDouble() * 1000000);
++    bigtime_t newTime = target;
++    {
++        // Renga: both decoders stop for the seek; the audio ring starts
++        // again at the audio track's new position.
++        BAutolock audio(m_audioDecodeLock);
++        BAutolock video(m_videoDecodeLock);
++        if (m_videoTrack) {
++            bigtime_t videoTime = target;
++            m_videoTrack->SeekToTime(&videoTime);
++            newTime = videoTime;
++            m_videoEOF = false;
++        }
++        if (m_audioTrack) {
++            bigtime_t audioTime = target;
++            m_audioTrack->SeekToTime(&audioTime);
++            newTime = audioTime;
++            ResetAudio(audioTime);
++            if (m_soundPlayer && !m_paused)
++                m_soundPlayer->Start();
++        }
+ 
+-    m_currentTime = newTime / 1000000.f;
++        m_currentTime = newTime / 1000000.f;
+ 
+-    if (m_paused && m_videoTrack && m_frameBuffer) {
+-        int64 count;
+-        if (m_videoTrack->ReadFrames(m_frameBuffer->Bits(), &count) == B_OK) {
+-            callOnMainThread([p = WeakPtr(this)] {
+-                if (p)
+-                    p->m_player.repaint();
+-            });
++        if (m_paused && m_videoTrack && m_decodeBuffer) {
++            int64 count;
++            if (m_videoTrack->ReadFrames(m_decodeBuffer->Bits(), &count) == B_OK) {
++                {
++                    BAutolock frame(m_frameLock);
++                    std::swap(m_frameBuffer, m_decodeBuffer);
++                }
++                callOnMainThread([p = WeakPtr(this)] {
++                    if (p)
++                        p->m_player.repaint();
++                });
++            }
+         }
+     }
+     m_player.timeChanged();
+     m_mediaLock.Unlock();
++    // The promise was never returned (undefined behaviour).
++    return MediaTimePromise::createAndResolve(WTF::MediaTime::createWithDouble(newTime / 1000000.0));
+ }
+ 
+ 
+@@ -399,6 +596,7 @@ void MediaPlayerPrivate::paint(GraphicsContext& context, const FloatRect& r)
+     if (context.paintingDisabled())
+         return;
+ 
++    BAutolock frame(const_cast<BLocker&>(m_frameLock));
+     if (m_frameBuffer) {
+         BView* target = context.platformContext();
+         target->SetDrawingMode(B_OP_COPY);
+@@ -435,6 +633,9 @@ void MediaPlayerPrivate::IdentifyTracks(const String& url)
+                 m_frameBuffer = new BBitmap(
+                     BRect(0, 0, format.Width() - 1, format.Height() - 1),
+                     B_RGB32);
++                m_decodeBuffer = new BBitmap(
++                    BRect(0, 0, format.Width() - 1, format.Height() - 1),
++                    B_RGB32);
+ 
+                 if (m_audioTrack)
+                     break;
+@@ -444,6 +645,7 @@ void MediaPlayerPrivate::IdentifyTracks(const String& url)
+                 if (m_audioTrack)
+                     continue;
+                 m_audioTrack = track;
++                SetUpAudio(format);
+ 
+                 m_soundPlayer = new BSoundPlayer(&format.u.raw_audio,
+                     "HTML5 Audio", playCallback, NULL, this);
+diff --git a/Source/WebCore/platform/graphics/haiku/MediaPlayerPrivateHaiku.h b/Source/WebCore/platform/graphics/haiku/MediaPlayerPrivateHaiku.h
+index cda1995..6dfcb8b 100644
+--- a/Source/WebCore/platform/graphics/haiku/MediaPlayerPrivateHaiku.h
++++ b/Source/WebCore/platform/graphics/haiku/MediaPlayerPrivateHaiku.h
+@@ -26,6 +26,10 @@
+ #include <wtf/WeakPtr.h>
+ 
+ #include <Locker.h>
++#include <OS.h>
++
++#include <atomic>
++#include <memory>
+ #include <ObjectList.h>
+ #include <private/netservices/UrlProtocolAsynchronousListener.h>
+ 
+@@ -34,6 +38,7 @@ class BDataIO;
+ class BMediaFile;
+ class BMediaTrack;
+ class BSoundPlayer;
++struct media_format;
+ struct media_raw_audio_format;
+ 
+ namespace WebCore {
+@@ -102,6 +107,12 @@ private:
+         void IdentifyTracks(const String& url);
+         static status_t loadingThread(void* cookie);
+         static status_t videoThread(void* cookie);
++        // Renga: audio is decoded by a thread of its own into a ring that
++        // the sound player's real-time callback only copies from.
++        static status_t audioThread(void* cookie);
++        void SetUpAudio(const media_format&);
++        void ResetAudio(bigtime_t mediaTime);
++        bool AudioDrained() const;
+ 
+ 
+         static void playCallback(void*, void*, size_t,
+@@ -119,14 +130,43 @@ private:
+         BBitmap* m_frameBuffer;
+         BLocker m_mediaLock;
+ 
++        // Renga: each track has its own decode lock, so decoding a video
++        // frame never holds up the audio callback (which used to wait for
++        // m_mediaLock while the video thread decoded under it).
++        BLocker m_audioDecodeLock { "html5 audio decode" };
++        BLocker m_videoDecodeLock { "html5 video decode" };
++        // Guards m_frameBuffer for paint(); frames are decoded into
++        // m_decodeBuffer and swapped in.
++        BLocker m_frameLock { "html5 frame" };
++        BBitmap* m_decodeBuffer { nullptr };
++        bool m_videoEOF { false };
++
++        // Decoded audio: one writer (audioThread), one reader (playCallback).
++        // m_ringLock is held only to copy or reset, never while decoding.
++        BLocker m_ringLock { "html5 audio ring" };
++        std::unique_ptr<uint8_t[]> m_ring;
++        size_t m_ringSize { 0 };
++        std::atomic<uint64_t> m_ringWritten { 0 };
++        std::atomic<uint64_t> m_ringRead { 0 };
++        std::unique_ptr<uint8_t[]> m_chunk;
++        size_t m_chunkSize { 0 };
++        size_t m_frameSize { 0 };
++        double m_frameRate { 0 };
++        uint32 m_sampleFormat { 0 };
++        bigtime_t m_audioStartTime { 0 };
++        uint64_t m_framesPlayed { 0 };
++        std::atomic<bool> m_audioEOF { false };
++        std::atomic<bool> m_endReported { false };
++        thread_id m_audioThread { -1 };
++
+         MediaPlayer& m_player;
+         MediaPlayer::NetworkState m_networkState;
+         MediaPlayer::ReadyState m_readyState;
+ 
+         float m_volume;
+-        float m_currentTime;
+-        bool m_paused;
+-        bool m_abort;
++        std::atomic<float> m_currentTime;
++        std::atomic<bool> m_paused;
++        std::atomic<bool> m_abort;
+ 
+         thread_id m_loadingThread;
+         thread_id m_videoThread;
