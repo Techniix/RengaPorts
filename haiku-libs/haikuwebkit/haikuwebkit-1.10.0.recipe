@@ -1,5 +1,5 @@
 # Renga build of HaikuWebKit 1.10.0: the HaikuPorts recipe (master,
-# revision 2) with two Renga patches (roadmap F-57, batch 8).
+# revision 2) with three Renga patches (roadmap F-57, batches 8 and 14).
 #
 # haikuwebkit-1.10.0-renga-html5-sound.patch, HTML5 <audio>/<video> sound
 # (MediaPlayerPrivateHaiku). Found with media_html5_test in the Renga
@@ -40,6 +40,30 @@
 # objects, several hours on the 2-core host. Build with HaikuPorter on
 # Renga, then check with media_html5_test (renga-raw) and a page with a
 # WebM and an MP4 clip.
+#
+# haikuwebkit-1.10.0-renga-media-sync.patch (revision 102, batch 14):
+# 1.10.0-101 on hardware: sound fine, video choppy and too fast.
+# - Data source: http(s) media is read through MediaDataSourceHaiku, a
+#   BPositionIO that downloads with libcurl into an unlinked temporary file
+#   and keeps a map of the byte ranges it has. ReadAt() blocks until the
+#   range asked for is there: it waits when the running request is at most
+#   4 MiB short of it, and otherwise restarts the request at the first
+#   missing byte ("Range: bytes=N-"). Short reads only at the end of the
+#   resource; errors only after an HTTP 4xx, five failed attempts in a row,
+#   or cancelLoad() (Abort(), B_CANCELED). BMediaFile(BUrl) through the
+#   http_streamer gave up after 10 s and could not seek ahead of the
+#   download. Other URLs, and http(s) that the source cannot open, still
+#   go through BMediaFile(BUrl).
+# - Video: each frame is presented by its PTS (media_header.start_time)
+#   against the audio clock (the buffer the sound player last took,
+#   interpolated, minus BSoundPlayer::Latency()). Early frames wait, a
+#   frame whose successor is already due is dropped (at least one frame
+#   every 250 ms is still shown), a seek drops the held frame, and repaint
+#   requests are coalesced. -101 showed every frame as soon as it was
+#   decoded and caught up after each stall at full decode speed.
+# Status (2026-11-27): Implemented, not compiled or tested. The patch
+# applies after the two above; the data source class was syntax-checked
+# on the Linux host against stub headers only.
 SUMMARY="Open source web browser engine"
 DESCRIPTION="
 WebKit is an open source web browser engine. WebKit is also the name of the \
@@ -51,7 +75,7 @@ COPYRIGHT="1998-2026 Apple Inc., Google Inc., Sony, Samsung, Igalia, et al"
 LICENSE="GNU LGPL v2
 	GNU LGPL v2.1
 	MIT"
-REVISION="101"
+REVISION="102"
 # Revisions from 100 up for Renga builds of HaikuPorts packages (README).
 
 SOURCE_URI="https://codeberg.org/haiku/haikuwebkit/releases/download/HaikuWebKit-$portVersion/haikuwebkit-$portVersion.tar.gz"
@@ -60,6 +84,7 @@ SOURCE_DIR="haikuwebkit"
 PATCHES="
 	haikuwebkit-$portVersion-renga-html5-sound.patch
 	haikuwebkit-$portVersion-renga-user-agent.patch
+	haikuwebkit-$portVersion-renga-media-sync.patch
 	"
 
 ARCHITECTURES="all !x86_gcc2"
