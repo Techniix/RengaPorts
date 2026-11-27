@@ -250,8 +250,8 @@ index f1590b71..83b5cc67 100644
 +            }
 +            m_active = false;
 +
-+            if (!m_gotResponseForRequest && (code == 200 || code == 206)) {
-+                // An empty body.
++            if (result == CURLE_OK && !m_gotResponseForRequest && (code == 200 || code == 206)) {
++                // An empty body (complete: a drop before the body is a retry).
 +                m_gotResponse = true;
 +                if (m_totalSize < 0)
 +                    m_totalSize = start;
