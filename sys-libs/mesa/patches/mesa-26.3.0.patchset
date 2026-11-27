@@ -862,3 +862,198 @@ index 95dacae..3b2dbcf 100644
 2.43.0
 
 
+From a87d26df845b430b48e8c83432d3f442f1b8ae65 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Fri, 27 Nov 2026 13:10:50 -0500
+Subject: [PATCH 1/2] zink: do not tear down a pb_cache that was never set up
+
+A screen that fails before zink_bo_init() (no Vulkan driver:
+vkCreateInstance VK_ERROR_INCOMPATIBLE_DRIVER; or no usable device)
+reaches zink_bo_deinit() from zink_destroy_screen() with a zeroed
+pb_cache. pb_cache_deinit() then locks its mutex, which was never
+initialised. With futexes (Linux) a zeroed simple_mtx is an unlocked
+one, so this goes unnoticed; on Haiku simple_mtx is a pthread mutex
+and the lock asserts (mutex->owner == -1), aborting eglInitialize()
+in GLInfo and GLTeapot on Renga before the EGL driver could fall back
+to llvmpipe (hardware report, Renga batch 14).
+
+Only deinit the cache when zink_bo_init() created its buckets.
+Upstream Mesa main (checked 2026-11-27) has the same unguarded call.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01AVRp8ouBQLa9azWMuCBbnb
+---
+ src/gallium/drivers/zink/zink_bo.c | 7 ++++++-
+ 1 file changed, 6 insertions(+), 1 deletion(-)
+
+diff --git a/src/gallium/drivers/zink/zink_bo.c b/src/gallium/drivers/zink/zink_bo.c
+index d78b7e3..ad63606 100644
+--- a/src/gallium/drivers/zink/zink_bo.c
++++ b/src/gallium/drivers/zink/zink_bo.c
+@@ -1437,7 +1437,12 @@ zink_bo_deinit(struct zink_screen *screen)
+ {
+    if (screen->pb.bo_slabs.groups)
+       pb_slabs_deinit(&screen->pb.bo_slabs);
+-   pb_cache_deinit(&screen->pb.bo_cache);
++   /* A screen that failed before zink_bo_init() (no Vulkan driver, no
++    * usable device) reaches here from zink_destroy_screen() with a zeroed
++    * cache: its mutex was never initialised, which pthread mutexes (Haiku,
++    * no futex) assert on when locked. */
++   if (screen->pb.bo_cache.buckets)
++      pb_cache_deinit(&screen->pb.bo_cache);
+ }
+ 
+ static bool
+-- 
+2.43.0
+
+
+From 488976b65218343c5ef1ff9beda820271a6121e4 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Fri, 27 Nov 2026 13:10:50 -0500
+Subject: [PATCH 2/2] egl/haiku: try Zink only with a non-CPU Vulkan device
+
+Follow-up to "egl/haiku: Zink when there is a Vulkan GPU, else the
+software rasteriser". That change tried zink_create_screen() whenever
+Zink was built and relied on Zink failing cleanly without a GPU. On
+Renga it does not (see "zink: do not tear down a pb_cache that was never
+set up"), and both cases on the maintainer's machine went through Zink:
+no Vulkan driver at all (vkCreateInstance VK_ERROR_INCOMPATIBLE_DRIVER)
+and only lavapipe.
+
+haiku_create_screen() now probes first: it opens the Vulkan loader,
+creates a minimal instance and looks for a physical device whose type is
+not VK_PHYSICAL_DEVICE_TYPE_CPU. Only then is Zink tried, and any Zink
+failure still falls back to llvmpipe/softpipe. GALLIUM_DRIVER=zink skips
+the probe (forces Zink); LIBGL_ALWAYS_SOFTWARE and GALLIUM_DRIVER=llvmpipe
+or softpipe keep choosing the software path without loading Vulkan.
+
+Checked: the probe compiles on its own with the Haiku cross compiler
+(-Wall -Wextra, no warnings) and on Linux, where it finds no GPU on a
+machine without one. Not built as part of Mesa here.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01AVRp8ouBQLa9azWMuCBbnb
+---
+ src/egl/drivers/haiku/egl_haiku.cpp | 96 ++++++++++++++++++++++++++---
+ 1 file changed, 86 insertions(+), 10 deletions(-)
+
+diff --git a/src/egl/drivers/haiku/egl_haiku.cpp b/src/egl/drivers/haiku/egl_haiku.cpp
+index ab38f0c..f57e15e 100644
+--- a/src/egl/drivers/haiku/egl_haiku.cpp
++++ b/src/egl/drivers/haiku/egl_haiku.cpp
+@@ -344,13 +344,83 @@ haiku_display_destroy(_EGLDisplay *disp)
+    free(hgl_dpy);
+ }
+ 
++#if defined(GALLIUM_ZINK)
++#include <vulkan/vulkan_core.h>
++
++/* Whether the Vulkan loader offers a physical device that is not a CPU
++ * (lavapipe) device. Only then is Zink worth trying: with no Vulkan driver
++ * at all vkCreateInstance() fails (VK_ERROR_INCOMPATIBLE_DRIVER), and with
++ * only lavapipe Zink refuses the device. Its failure path is not safe on
++ * Haiku either (it tears down a pb_cache it never set up, see the zink_bo
++ * patch), and a probe here costs one instance, not a screen. */
++static bool
++haiku_vulkan_gpu_present(void)
++{
++   void *loader = dlopen("libvulkan.so.1", RTLD_NOW | RTLD_LOCAL);
++   if (loader == NULL)
++      return false;
++
++   bool found = false;
++   PFN_vkGetInstanceProcAddr getInstanceProcAddr =
++      (PFN_vkGetInstanceProcAddr)dlsym(loader, "vkGetInstanceProcAddr");
++   PFN_vkCreateInstance createInstance = getInstanceProcAddr != NULL
++      ? (PFN_vkCreateInstance)getInstanceProcAddr(NULL, "vkCreateInstance")
++      : NULL;
++   if (createInstance != NULL) {
++      VkApplicationInfo application = {};
++      application.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO;
++      application.pEngineName = "mesa egl haiku probe";
++      application.apiVersion = VK_API_VERSION_1_0;
++      VkInstanceCreateInfo info = {};
++      info.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO;
++      info.pApplicationInfo = &application;
++      VkInstance instance = VK_NULL_HANDLE;
++      if (createInstance(&info, NULL, &instance) == VK_SUCCESS) {
++         PFN_vkDestroyInstance destroyInstance = (PFN_vkDestroyInstance)
++            getInstanceProcAddr(instance, "vkDestroyInstance");
++         PFN_vkEnumeratePhysicalDevices enumerateDevices =
++            (PFN_vkEnumeratePhysicalDevices)getInstanceProcAddr(instance,
++               "vkEnumeratePhysicalDevices");
++         PFN_vkGetPhysicalDeviceProperties getProperties =
++            (PFN_vkGetPhysicalDeviceProperties)getInstanceProcAddr(instance,
++               "vkGetPhysicalDeviceProperties");
++         uint32_t count = 0;
++         if (enumerateDevices != NULL && getProperties != NULL
++             && enumerateDevices(instance, &count, NULL) == VK_SUCCESS
++             && count > 0) {
++            VkPhysicalDevice *devices =
++               (VkPhysicalDevice *)calloc(count, sizeof(VkPhysicalDevice));
++            if (devices != NULL) {
++               VkResult result = enumerateDevices(instance, &count, devices);
++               if (result == VK_SUCCESS || result == VK_INCOMPLETE) {
++                  for (uint32_t i = 0; i < count && !found; i++) {
++                     VkPhysicalDeviceProperties properties;
++                     getProperties(devices[i], &properties);
++                     found = properties.deviceType
++                        != VK_PHYSICAL_DEVICE_TYPE_CPU;
++                  }
++               }
++               free(devices);
++            }
++         }
++         if (destroyInstance != NULL)
++            destroyInstance(instance, NULL);
++      }
++   }
++   dlclose(loader);
++   return found;
++}
++#endif
++
+ /* The Gallium screen behind EGL on Haiku/Renga: Zink on the GPU's Vulkan
+  * driver when there is one (NVK on NVIDIA, through Quasar), otherwise the
+- * software rasteriser this Mesa was built with. Zink refuses CPU Vulkan
+- * devices (lavapipe) unless asked for one, so a machine without a GPU
+- * driver falls through to llvmpipe. GALLIUM_DRIVER (llvmpipe, softpipe)
+- * and LIBGL_ALWAYS_SOFTWARE choose the software path explicitly, as on
+- * other platforms. One build serves both, so a system Mesa can carry Zink. */
++ * software rasteriser this Mesa was built with. Zink is tried only when the
++ * Vulkan loader offers a physical device that is not a CPU device
++ * (lavapipe), and any Zink failure falls back to the software rasteriser.
++ * GALLIUM_DRIVER (llvmpipe, softpipe) and LIBGL_ALWAYS_SOFTWARE choose the
++ * software path explicitly, as on other platforms; GALLIUM_DRIVER=zink
++ * skips the probe. One build serves both, so a system Mesa can carry
++ * Zink. */
+ static struct pipe_screen *
+ haiku_create_screen(struct sw_winsys *winsys)
+ {
+@@ -360,11 +430,17 @@ haiku_create_screen(struct sw_winsys *winsys)
+ 
+ #if defined(GALLIUM_ZINK)
+    if (!software) {
+-      struct pipe_screen *screen = zink_create_screen(winsys, NULL);
+-      if (screen != NULL)
+-         return screen;
+-      _eglLog(_EGL_INFO, "Haiku EGL: Zink found no Vulkan GPU, "
+-              "using a software rasteriser");
++      const bool forced = strcmp(driver, "zink") == 0;
++      if (forced || haiku_vulkan_gpu_present()) {
++         struct pipe_screen *screen = zink_create_screen(winsys, NULL);
++         if (screen != NULL)
++            return screen;
++         _eglLog(_EGL_INFO, "Haiku EGL: Zink failed, "
++                 "using a software rasteriser");
++      } else {
++         _eglLog(_EGL_INFO, "Haiku EGL: no Vulkan GPU, "
++                 "using a software rasteriser");
++      }
+    }
+ #endif
+ #if defined(GALLIUM_LLVMPIPE) || defined(GALLIUM_SOFTPIPE)
+-- 
+2.43.0
+
