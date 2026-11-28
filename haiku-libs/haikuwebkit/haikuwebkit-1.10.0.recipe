@@ -61,13 +61,18 @@
 # - A stall of 10 s ends playback with a network error (no rebuffering).
 # - Media requests carry no cookies or HTTP authentication; the temporary
 #   file grows to the size of the resource.
+# - Quitting WebPositive while media plays often crashes at exit (seen in
+#   QEMU in 10 of about 40 quits, also with the earlier -102 builds): a
+#   segment violation in libmedia's SoundPlayNode (SharedBufferList::Lock)
+#   or, once, in the video decoder thread's ReadFrames(). The players are
+#   not destroyed before the application goes away; not fixed here.
 # Status (2026-11-28): built natively in the Renga build VM (HaikuPorter);
 # QEMU Tested in WebPositive with an H.264+AAC MP4 and a VP9+Opus WebM,
 # from a server without ranges and from one with ranges (206): picture in
 # step with currentTime, continuous sound, forward and backward seeks,
 # "ended" at the end; a stalled server gives a network error 10 s after
 # the read stalls, with the browser responsive during a seek in the
-# stall; leaving the page or quitting during a stall ends at once.
+# stall; leaving the page during a stall ends the player at once.
 # Hardware test of the choppy/too-fast symptom pending.
 SUMMARY="Open source web browser engine"
 DESCRIPTION="
