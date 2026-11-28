@@ -1,5 +1,5 @@
 diff --git a/Source/WebCore/platform/graphics/haiku/MediaPlayerPrivateHaiku.cpp b/Source/WebCore/platform/graphics/haiku/MediaPlayerPrivateHaiku.cpp
-index f1590b7..084fba5 100644
+index f1590b7..53f3dd5 100644
 --- a/Source/WebCore/platform/graphics/haiku/MediaPlayerPrivateHaiku.cpp
 +++ b/Source/WebCore/platform/graphics/haiku/MediaPlayerPrivateHaiku.cpp
 @@ -39,13 +39,571 @@
@@ -1040,11 +1040,14 @@ index f1590b7..084fba5 100644
      }
  
      return B_OK;
-@@ -452,8 +1263,12 @@ status_t MediaPlayerPrivate::videoThread(void* cookie)
+@@ -452,13 +1263,21 @@ status_t MediaPlayerPrivate::videoThread(void* cookie)
  
  void MediaPlayerPrivate::play()
  {
 -    if (m_soundPlayer)
++    // Renga: under m_playStateLock, like the seek thread's and the loading
++    // thread's Start(), so that a pause() in between cannot be undone.
++    BAutolock playState(m_playStateLock);
 +    if (m_soundPlayer) {
          m_soundPlayer->Start();
 +        // Renga: what is heard lags what the callback hands over.
@@ -1054,7 +1057,13 @@ index f1590b7..084fba5 100644
      m_paused = false;
  }
  
-@@ -492,66 +1307,158 @@ WTF::MediaTime MediaPlayerPrivate::duration() const
+ void MediaPlayerPrivate::pause()
+ {
++    BAutolock playState(m_playStateLock);
+     if (m_soundPlayer)
+         m_soundPlayer->Stop(false);
+     m_paused = true;
+@@ -492,66 +1311,159 @@ WTF::MediaTime MediaPlayerPrivate::duration() const
  {
      // Renga: the longer of the two tracks, so a video without an audio
      // track has a duration too (it reported none and did not advance).
@@ -1183,6 +1192,7 @@ index f1590b7..084fba5 100644
 +            failed |= m_audioTrack->SeekToTime(&audioTime) != B_OK;
              newTime = audioTime;
              ResetAudio(audioTime);
++            BAutolock playState(m_playStateLock);
              if (m_soundPlayer && !m_paused)
                  m_soundPlayer->Start();
          }
@@ -1233,7 +1243,7 @@ index f1590b7..084fba5 100644
  }
  
  
-@@ -611,11 +1518,22 @@ void MediaPlayerPrivate::IdentifyTracks(const String& url)
+@@ -611,11 +1523,22 @@ void MediaPlayerPrivate::IdentifyTracks(const String& url)
      // TODO something here is blocking inside the Media Kit. We should rework
      // things so that this is run in a separate thread (Media Thread?). This
      // would avoid the annoying freeze whenever a media is being loaded.
@@ -1258,7 +1268,7 @@ index f1590b7..084fba5 100644
  
      if (m_mediaFile->InitCheck() == B_OK) {
          for (int i = m_mediaFile->CountTracks() - 1; i >= 0; i--)
-@@ -629,6 +1547,7 @@ void MediaPlayerPrivate::IdentifyTracks(const String& url)
+@@ -629,6 +1552,7 @@ void MediaPlayerPrivate::IdentifyTracks(const String& url)
                  if (m_videoTrack)
                      continue;
                  m_videoTrack = track;
@@ -1266,7 +1276,7 @@ index f1590b7..084fba5 100644
  
                  m_frameBuffer = new BBitmap(
                      BRect(0, 0, format.Width() - 1, format.Height() - 1),
-@@ -636,6 +1555,20 @@ void MediaPlayerPrivate::IdentifyTracks(const String& url)
+@@ -636,6 +1560,20 @@ void MediaPlayerPrivate::IdentifyTracks(const String& url)
                  m_decodeBuffer = new BBitmap(
                      BRect(0, 0, format.Width() - 1, format.Height() - 1),
                      B_RGB32);
@@ -1287,7 +1297,7 @@ index f1590b7..084fba5 100644
  
                  if (m_audioTrack)
                      break;
-@@ -645,13 +1578,19 @@ void MediaPlayerPrivate::IdentifyTracks(const String& url)
+@@ -645,13 +1583,20 @@ void MediaPlayerPrivate::IdentifyTracks(const String& url)
                  if (m_audioTrack)
                      continue;
                  m_audioTrack = track;
@@ -1301,6 +1311,7 @@ index f1590b7..084fba5 100644
 +                // Renga: without a working sound player the video keeps
 +                // the system clock rather than waiting for sound.
 +                m_audioClockUsable = m_soundPlayer->InitCheck() == B_OK;
++                BAutolock playState(m_playStateLock);
 +                if (!m_paused) {
                      m_soundPlayer->Start();
 +                    m_audioLatency = std::clamp<bigtime_t>(m_soundPlayer->Latency(), 0, 500000);
@@ -1309,7 +1320,7 @@ index f1590b7..084fba5 100644
                  if (m_videoTrack && m_audioTrack)
                      break;
 diff --git a/Source/WebCore/platform/graphics/haiku/MediaPlayerPrivateHaiku.h b/Source/WebCore/platform/graphics/haiku/MediaPlayerPrivateHaiku.h
-index 6dfcb8b..e877ca0 100644
+index 6dfcb8b..71ab10c 100644
 --- a/Source/WebCore/platform/graphics/haiku/MediaPlayerPrivateHaiku.h
 +++ b/Source/WebCore/platform/graphics/haiku/MediaPlayerPrivateHaiku.h
 @@ -44,6 +44,8 @@ struct media_raw_audio_format;
@@ -1360,7 +1371,7 @@ index 6dfcb8b..e877ca0 100644
  
          // Decoded audio: one writer (audioThread), one reader (playCallback).
          // m_ringLock is held only to copy or reset, never while decoding.
-@@ -159,6 +175,55 @@ private:
+@@ -159,6 +175,58 @@ private:
          std::atomic<bool> m_endReported { false };
          thread_id m_audioThread { -1 };
  
@@ -1403,6 +1414,9 @@ index 6dfcb8b..e877ca0 100644
 +        // last seek set, for the video thread's clock.
 +        BLocker m_seekLock { "html5 media seek" };
 +        BLocker m_timeLock { "html5 media time" };
++        // Renga: play(), pause() and the other threads' m_soundPlayer
++        // Start() check m_paused and start or stop the sound under this.
++        BLocker m_playStateLock { "html5 media play state" };
 +        std::atomic<bigtime_t> m_seekTime { 0 };
 +        std::atomic<int32_t> m_seekPending { 0 };
 +        std::atomic<uint32_t> m_seekSerial { 0 };

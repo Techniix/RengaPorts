@@ -45,6 +45,8 @@
 #   decoder threads' blocked reads are interrupted first, so the main
 #   thread never waits for the network. The whole duration is seekable
 #   with MediaDataSourceHaiku (1.10.0 clamped seeks to the current time).
+#   play(), pause() and the sound player's Start() in the seek and loading
+#   threads go through one lock, so a pause() during a seek holds.
 # - End and errors: after the last frame the time runs on to duration()
 #   and the end is reported (it stood just short of it and "ended" never
 #   came). A read that fails for good (not the end: the FFmpeg reader
@@ -59,13 +61,23 @@
 # - One transfer at a time: two readers far apart in a file whose tracks
 #   are not interleaved take turns of at least 1 s each.
 # - A stall of 10 s ends playback with a network error (no rebuffering).
+#   The deadline also covers the loading thread's probe reads: from a
+#   server that answers 200 to ranges, an MP4 with its index at the end
+#   fails to load when downloading up to the index takes over 10 s.
+#   Follow-up idea: apply the deadline only to the seek thread's reads, or
+#   clear it once the download makes progress again.
+# - A decoder read interrupted by a seek leaves the FFmpeg reader's state
+#   to the seek's SeekToTime() to reset; not verified beyond the tests.
 # - Media requests carry no cookies or HTTP authentication; the temporary
 #   file grows to the size of the resource.
-# - Quitting WebPositive while media plays often crashes at exit (seen in
-#   QEMU in 10 of about 40 quits, also with the earlier -102 builds): a
+# - Quitting WebPositive while media plays often crashes at exit: a
 #   segment violation in libmedia's SoundPlayNode (SharedBufferList::Lock)
-#   or, once, in the video decoder thread's ReadFrames(). The players are
-#   not destroyed before the application goes away; not fixed here.
+#   or, once, in the video decoder thread's ReadFrames(). Not new with
+#   -102: in QEMU, quitting after 8 s of playback, 20 times each and
+#   alternating, crashed 19 of 20 times with -101 (the published package)
+#   and 20 of 20 with -102, all in SharedBufferList::Lock.
+#   Follow-up: tear down the media players when the application quits
+#   (WebPositive/HaikuWebKit); they are not destroyed before it goes away.
 # Status (2026-11-28): built natively in the Renga build VM (HaikuPorter);
 # QEMU Tested in WebPositive with an H.264+AAC MP4 and a VP9+Opus WebM,
 # from a server without ranges and from one with ranges (206): picture in
@@ -73,6 +85,9 @@
 # "ended" at the end; a stalled server gives a network error 10 s after
 # the read stalls, with the browser responsive during a seek in the
 # stall; leaving the page during a stall ends the player at once.
+# Final round (2026-11-28): the play/pause/seek lock, rebuilt
+# (HaikuPorter); playback and forward and backward seeks rechecked on both
+# clips with both servers.
 # Hardware test of the choppy/too-fast symptom pending.
 SUMMARY="Open source web browser engine"
 DESCRIPTION="
