@@ -61,9 +61,21 @@
 #   every 250 ms is still shown), a seek drops the held frame, and repaint
 #   requests are coalesced. -101 showed every frame as soon as it was
 #   decoded and caught up after each stall at full decode speed.
-# Status (2026-11-27): Implemented, not compiled or tested. The patch
-# applies after the two above; the data source class was syntax-checked
-# on the Linux host against stub headers only.
+# - Video PTS: counted from the last seek (BMediaTrack::SeekToTime()'s
+#   time plus one frame duration per frame), not media_header.start_time,
+#   which the FFmpeg plug-in gives for video in the stream's time base
+#   (frame numbers in a 1/24 MP4, milliseconds in a WebM): read as
+#   microseconds, every frame was late and dropped, the decoder ran to the
+#   end within seconds and the last frame stayed on screen. Assumes a
+#   constant frame rate.
+# - End: the time runs on to duration() after the last frame and the end
+#   is reported (it stood just short of it, and "ended" never came).
+# - Seeking: the whole duration is seekable when MediaDataSourceHaiku reads
+#   the media (1.10.0 clamped every seek to at most the current time).
+# Status (2026-11-28): built natively in the Renga build VM (HaikuPorter);
+# QEMU Tested with WebPositive: an H.264+AAC MP4 and a VP9+Opus WebM play
+# with the picture in step with currentTime, continuous sound, forward
+# and backward seeks, and "ended" at the end.
 SUMMARY="Open source web browser engine"
 DESCRIPTION="
 WebKit is an open source web browser engine. WebKit is also the name of the \
