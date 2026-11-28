@@ -1,45 +1,94 @@
 # Renga build of HaikuWebKit 1.10.0: the HaikuPorts recipe (master,
-# revision 2) with two Renga patches (roadmap F-57, batch 8).
+# revision 2) with three Renga patches (roadmap F-57, batches 8 and 14),
+# applied in this order.
 #
-# haikuwebkit-1.10.0-renga-html5-sound.patch, HTML5 <audio>/<video> sound
-# (MediaPlayerPrivateHaiku). Found with media_html5_test in the Renga
-# harness using the packaged 1.10.0 binary: WebM sound with gaps (about
-# 90 % of 10 ms blocks silent), MP4 sound missing, while the Media Kit part
-# of the same path plays both cleanly. Causes in 1.10.0's player:
-# - the sound player's real-time callback locked m_mediaLock, which the
-#   video thread held while decoding a frame (tens of ms on a slow or
-#   emulated CPU), so the callback missed its deadline;
-# - the callback decoded one chunk with ReadFrames() whatever the buffer's
-#   size: a larger buffer kept old data in its tail, a smaller one was
-#   overrun.
-# Now audio is decoded by an "audio decoder" thread into a half-second
-# ring; the callback only copies exactly its buffer's size out of it (a
-# short ring lock, never held while decoding) and plays silence for
-# what is not decoded yet; the clock is the audio actually played. Each
-# track has its own decode lock; video frames are decoded into a second
-# bitmap and swapped in under a frame lock, which paint() takes. After
-# the sound ends, the video goes on with the system clock. Also:
-# duration() is the longer track (a video without an audio track had
-# none), seekToTarget() stops both decoders, restarts the ring at the
-# audio track's new position, and returns its promise (it returned
-# nothing: undefined behaviour).
-# Replaces haikuwebkit-1.10.0-renga-video-only.patch (revision 100, never
-# built), which was written against haikuwebkit's "haiku" branch and does
-# not apply to the 1.10.0 tarball (one hunk fails); 1.10.0 already runs a
-# video without audio on the system clock, and its duration fix is in the
-# new patch.
+# haikuwebkit-1.10.0-renga-html5-sound.patch (revision 101), HTML5
+# <audio>/<video> sound in MediaPlayerPrivateHaiku. Found with
+# media_html5_test using the packaged 1.10.0: WebM sound with gaps, MP4
+# sound missing. The sound player's real-time callback locked m_mediaLock,
+# which the video thread held while decoding, and decoded one chunk per
+# buffer whatever its size. Now an "audio decoder" thread fills a
+# half-second ring and the callback only copies its buffer's size out of
+# it (silence for what is not decoded yet); each track has its own decode
+# lock; video frames are decoded into a second bitmap and swapped in.
+# Also: duration() is the longer track, and seekToTarget() stops both
+# decoders and returns its promise.
 #
 # haikuwebkit-1.10.0-renga-user-agent.patch: Version/26.0 (Safari 26)
-# instead of 17.0 in the user agent, nothing else changed.
+# instead of 17.0 in the user agent.
 #
-# Status (2026-11-20): Implemented, not tested. Both patches apply to the
-# 1.10.0 tarball; MediaPlayerPrivateHaiku.cpp compiles with Renga's
-# x86_64-unknown-haiku cross-compiler (GCC 13.3) against Renga's
-# haiku_devel and HaikuPorts' devel packages on the Linux build host. The
-# whole engine was not built there: WebCore alone is about 690 unified
-# objects, several hours on the 2-core host. Build with HaikuPorter on
-# Renga, then check with media_html5_test (renga-raw) and a page with a
-# WebM and an MP4 clip.
+# haikuwebkit-1.10.0-renga-media-sync.patch (revision 102, batch 14).
+# On hardware 1.10.0-101 played sound fine, but video choppy and too fast.
+# - Data source: http(s) media is read through MediaDataSourceHaiku, a
+#   BPositionIO that downloads with libcurl into an unlinked temporary file
+#   and keeps a map of the byte ranges it has. A read waits for its bytes
+#   when the running request brings them within about a second at its
+#   rate, and otherwise restarts the request there ("Range: bytes=N-"); a
+#   request runs at least 1 s before a distant reader moves it. A read
+#   fails after 10 s without its bytes, after an HTTP 4xx or five failed
+#   attempts in a row, and on cancelLoad(). Servers that answer 200 to a
+#   range are read from the start only. Other URLs, and http(s) the source
+#   cannot open, go through BMediaFile(BUrl) as before.
+# - Video by PTS against the audio clock (the buffer the sound player took
+#   last, interpolated, minus its latency), or the system clock without
+#   sound. Early frames wait, a frame whose successor is due is dropped
+#   (one frame at least every 250 ms is still shown), a seek drops the
+#   held frame, repaints are coalesced. The PTS is counted from the last
+#   seek (SeekToTime()'s time plus n / frame rate, rounded per frame), not
+#   taken from media_header.start_time, which the FFmpeg plug-in gives for
+#   video in the stream's time base (frame numbers in a 1/24 MP4,
+#   milliseconds in a WebM): read as microseconds, every frame was late,
+#   the decoder ran to the end within seconds and its last frame stayed on
+#   screen. The frame rate is the decoder's field rate when it is between
+#   1 and 240, else frames over duration, else 25.
+# - Seeks run on their own thread and settle the promise when done: the
+#   decoder threads' blocked reads are interrupted first, so the main
+#   thread never waits for the network. The whole duration is seekable
+#   with MediaDataSourceHaiku (1.10.0 clamped seeks to the current time).
+#   play(), pause() and the sound player's Start() in the seek and loading
+#   threads go through one lock, so a pause() during a seek holds.
+# - End and errors: after the last frame the time runs on to duration()
+#   and the end is reported (it stood just short of it and "ended" never
+#   came). A read that fails for good (not the end: the FFmpeg reader
+#   reports both as B_LAST_BUFFER_ERROR, the data source tells them apart)
+#   is reported once as a network error, without "ended".
+# Known limits:
+# - Counted PTS assume a constant frame rate, no frames skipped by the
+#   decoder, a first frame at 0 and, after a seek, a first frame at the
+#   time SeekToTime() gives (B-frame streams can start later); this goes
+#   once the FFmpeg plug-in gives video start_time in microseconds (OS
+#   side).
+# - One transfer at a time: two readers far apart in a file whose tracks
+#   are not interleaved take turns of at least 1 s each.
+# - A stall of 10 s ends playback with a network error (no rebuffering).
+#   The deadline also covers the loading thread's probe reads: from a
+#   server that answers 200 to ranges, an MP4 with its index at the end
+#   fails to load when downloading up to the index takes over 10 s.
+#   Follow-up idea: apply the deadline only to the seek thread's reads, or
+#   clear it once the download makes progress again.
+# - A decoder read interrupted by a seek leaves the FFmpeg reader's state
+#   to the seek's SeekToTime() to reset; not verified beyond the tests.
+# - Media requests carry no cookies or HTTP authentication; the temporary
+#   file grows to the size of the resource.
+# - Quitting WebPositive while media plays often crashes at exit: a
+#   segment violation in libmedia's SoundPlayNode (SharedBufferList::Lock)
+#   or, once, in the video decoder thread's ReadFrames(). Not new with
+#   -102: in QEMU, quitting after 8 s of playback, 20 times each and
+#   alternating, crashed 19 of 20 times with -101 (the published package)
+#   and 20 of 20 with -102, all in SharedBufferList::Lock.
+#   Follow-up: tear down the media players when the application quits
+#   (WebPositive/HaikuWebKit); they are not destroyed before it goes away.
+# Status (2026-11-28): built natively in the Renga build VM (HaikuPorter);
+# QEMU Tested in WebPositive with an H.264+AAC MP4 and a VP9+Opus WebM,
+# from a server without ranges and from one with ranges (206): picture in
+# step with currentTime, continuous sound, forward and backward seeks,
+# "ended" at the end; a stalled server gives a network error 10 s after
+# the read stalls, with the browser responsive during a seek in the
+# stall; leaving the page during a stall ends the player at once.
+# Final round (2026-11-28): the play/pause/seek lock, rebuilt
+# (HaikuPorter); playback and forward and backward seeks rechecked on both
+# clips with both servers.
+# Hardware test of the choppy/too-fast symptom pending.
 SUMMARY="Open source web browser engine"
 DESCRIPTION="
 WebKit is an open source web browser engine. WebKit is also the name of the \
@@ -51,7 +100,7 @@ COPYRIGHT="1998-2026 Apple Inc., Google Inc., Sony, Samsung, Igalia, et al"
 LICENSE="GNU LGPL v2
 	GNU LGPL v2.1
 	MIT"
-REVISION="101"
+REVISION="102"
 # Revisions from 100 up for Renga builds of HaikuPorts packages (README).
 
 SOURCE_URI="https://codeberg.org/haiku/haikuwebkit/releases/download/HaikuWebKit-$portVersion/haikuwebkit-$portVersion.tar.gz"
@@ -60,6 +109,7 @@ SOURCE_DIR="haikuwebkit"
 PATCHES="
 	haikuwebkit-$portVersion-renga-html5-sound.patch
 	haikuwebkit-$portVersion-renga-user-agent.patch
+	haikuwebkit-$portVersion-renga-media-sync.patch
 	"
 
 ARCHITECTURES="all !x86_gcc2"
