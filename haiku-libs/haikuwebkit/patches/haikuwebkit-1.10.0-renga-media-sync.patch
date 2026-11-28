@@ -1,8 +1,8 @@
 diff --git a/Source/WebCore/platform/graphics/haiku/MediaPlayerPrivateHaiku.cpp b/Source/WebCore/platform/graphics/haiku/MediaPlayerPrivateHaiku.cpp
-index f1590b7..de849c4 100644
+index f1590b7..084fba5 100644
 --- a/Source/WebCore/platform/graphics/haiku/MediaPlayerPrivateHaiku.cpp
 +++ b/Source/WebCore/platform/graphics/haiku/MediaPlayerPrivateHaiku.cpp
-@@ -39,13 +39,498 @@
+@@ -39,13 +39,571 @@
  #include <View.h>
  #include <OS.h>
  #include <Autolock.h>
@@ -36,10 +36,12 @@ index f1590b7..de849c4 100644
 +	it waits when the running request is about to deliver them, and
 +	otherwise restarts the request at the first missing byte with an HTTP
 +	range ("bytes=N-"). A read returns fewer bytes only at the end of the
-+	resource, and an error only when the download failed for good (an HTTP
-+	4xx, or five failed attempts in a row) or the player went away
-+	(Abort()). Servers that ignore ranges (200 to "bytes=0-") are read
-+	from the start only.
++	resource, and an error when the download failed for good (an HTTP
++	4xx, or five failed attempts in a row), when the bytes have not come
++	within kReadDeadline (B_TIMED_OUT, also for a server that only
++	trickles), or when the player went away (Abort(), B_CANCELED) or
++	seeks (SetInterrupted(), B_INTERRUPTED). Servers that ignore ranges
++	(200 to "bytes=0-") are read from the start only.
 +*/
 +class MediaDataSourceHaiku final : public BPositionIO {
 +public:
@@ -108,6 +110,24 @@ index f1590b7..de849c4 100644
 +            release_sem(m_requestSem);
 +    }
 +
++    // While set, reads return B_INTERRUPTED at once, blocked ones too: a
++    // seek uses it to get the decoder threads (which read while holding
++    // their decode locks) out of the way. The download goes on.
++    void SetInterrupted(bool interrupted)
++    {
++        BAutolock locker(m_lock);
++        m_interrupted = interrupted;
++        if (interrupted)
++            WakeWaiters();
++    }
++
++    // A read failed for good (the download failed, or a read timed out).
++    bool HasFailed() const
++    {
++        BAutolock locker(m_lock);
++        return m_failed || m_readFailed;
++    }
++
 +    ssize_t ReadAt(off_t position, void* buffer, size_t size) final
 +    {
 +        if (position < 0)
@@ -115,11 +135,16 @@ index f1590b7..de849c4 100644
 +        if (!size)
 +            return 0;
 +
++        const bigtime_t deadline = system_time() + kReadDeadline;
 +        m_lock.Lock();
 +        for (;;) {
 +            if (m_abort) {
 +                m_lock.Unlock();
 +                return B_CANCELED;
++            }
++            if (m_interrupted) {
++                m_lock.Unlock();
++                return B_INTERRUPTED;
 +            }
 +            if (m_totalSize >= 0) {
 +                if (position >= m_totalSize) {
@@ -132,25 +157,43 @@ index f1590b7..de849c4 100644
 +            off_t covered = CoveredFrom(position);
 +            if (covered >= (off_t)size)
 +                break;
-+            if (m_failed) {
++            // After one read timed out the others do not wait their own
++            // deadline: the player reports the error once, and a seek or
++            // the decoder threads give up at once.
++            if (m_failed || m_readFailed) {
 +                m_lock.Unlock();
 +                if (covered > 0)
 +                    return pread(m_fd, buffer, (size_t)covered, position);
 +                return B_IO_ERROR;
 +            }
++            bigtime_t now = system_time();
++            if (now >= deadline) {
++                // The old adapter's 10 s, but as an error the player
++                // reports, not as the end of the media.
++                m_readFailed = true;
++                m_lock.Unlock();
++                return B_TIMED_OUT;
++            }
 +
 +            off_t missing = position + covered;
 +            bool coming;
 +            if (m_wanted >= 0)
-+                coming = missing >= m_wanted && missing - m_wanted <= kNearWindow;
++                coming = missing >= m_wanted && missing - m_wanted <= NearWindow(now);
 +            else
-+                coming = m_active && missing >= m_cursor && missing - m_cursor <= kNearWindow;
++                coming = m_active && missing >= m_cursor && missing - m_cursor <= NearWindow(now);
 +            if (!m_rangeSupported)
 +                coming = m_active || m_wanted >= 0;
++            // A request runs for at least kMinHold before a reader far
++            // from it moves it, so that two readers far apart (a file
++            // whose tracks are not interleaved) each get data in turn
++            // instead of restarting the transfer on every read.
++            if (!coming && m_active && m_wanted < 0
++                && now - m_requestStartTime < kMinHold)
++                coming = true;
 +            if (!coming)
 +                RequestFrom(m_rangeSupported ? missing : 0);
 +
-+            WaitLocked();
++            WaitLocked(deadline - now);
 +        }
 +        m_lock.Unlock();
 +
@@ -201,10 +244,19 @@ index f1590b7..de849c4 100644
 +    }
 +
 +private:
-+    // A missing byte this close ahead of the running request is waited
-+    // for rather than fetched with a new request.
++    // A missing byte ahead of the running request is waited for, rather
++    // than fetched with a new request, when the request brings it within
++    // about kNearTime at its rate so far (at least kMinNearWindow, at most
++    // kNearWindow). A fixed 4 MiB window waited 9 s on a 150 KB/s link for
++    // the index at the end of an MP4, close to the read deadline.
 +    static constexpr off_t kNearWindow = 4 * 1024 * 1024;
++    static constexpr off_t kMinNearWindow = 64 * 1024;
++    static constexpr bigtime_t kNearTime = 1000000;
 +    static constexpr int kMaxFailures = 5;
++    // A read waits at most this long for its bytes.
++    static constexpr bigtime_t kReadDeadline = 10000000;
++    // A request is not moved elsewhere before it ran this long.
++    static constexpr bigtime_t kMinHold = 1000000;
 +
 +    struct Transfer {
 +        MediaDataSourceHaiku* source;
@@ -223,7 +275,8 @@ index f1590b7..de849c4 100644
 +    void Download()
 +    {
 +        m_lock.Lock();
-+        while (!m_abort) {
++        // After a read timed out nothing more is read: stop downloading.
++        while (!m_abort && !m_readFailed) {
 +            if (m_wanted < 0) {
 +                m_lock.Unlock();
 +                acquire_sem_etc(m_requestSem, 1, B_RELATIVE_TIMEOUT, 1000000);
@@ -235,6 +288,7 @@ index f1590b7..de849c4 100644
 +            m_wanted = -1;
 +            uint32 generation = ++m_generation;
 +            m_requestStart = start;
++            m_requestStartTime = system_time();
 +            m_cursor = start;
 +            m_active = true;
 +            m_gotResponseForRequest = false;
@@ -274,7 +328,8 @@ index f1590b7..de849c4 100644
 +                m_wanted = m_rangeSupported ? m_cursor : 0;
 +                int failures = m_failures;
 +                m_lock.Unlock();
-+                snooze(500000 * failures);
++                // Abort() (and a new request) wake this early.
++                acquire_sem_etc(m_requestSem, 1, B_RELATIVE_TIMEOUT, 500000 * failures);
 +                m_lock.Lock();
 +            }
 +            WakeWaiters();
@@ -359,8 +414,10 @@ index f1590b7..de849c4 100644
 +        Transfer* transfer = static_cast<Transfer*>(cookie);
 +        MediaDataSourceHaiku* source = transfer->source;
 +        BAutolock locker(source->m_lock);
-+        // Non-zero ends the transfer: superseded or aborted.
-+        return source->m_abort || transfer->generation != source->m_generation;
++        // Non-zero ends the transfer: superseded, aborted, or a read
++        // timed out.
++        return source->m_abort || source->m_readFailed
++            || transfer->generation != source->m_generation;
 +    }
 +
 +    size_t Received(Transfer& transfer, const char* data, size_t size)
@@ -411,6 +468,18 @@ index f1590b7..de849c4 100644
 +        return size;
 +    }
 +
++    // How far ahead of the running request a missing byte is waited for;
++    // lock held.
++    off_t NearWindow(bigtime_t now) const
++    {
++        bigtime_t elapsed = now - m_requestStartTime;
++        off_t received = m_cursor - m_requestStart;
++        if (!m_active || elapsed < 250000 || received <= 0)
++            return 4 * kMinNearWindow;
++        off_t window = (off_t)(received * (double)kNearTime / elapsed);
++        return std::clamp(window, kMinNearWindow, kNearWindow);
++    }
++
 +    // How many bytes from position on are downloaded; lock held.
 +    off_t CoveredFrom(off_t position) const
 +    {
@@ -448,13 +517,14 @@ index f1590b7..de849c4 100644
 +        release_sem(m_requestSem);
 +    }
 +
-+    // Waits for news from the download thread (at most 200 ms, then the
-+    // caller checks again); lock held, and held again on return.
-+    void WaitLocked()
++    // Waits for news from the download thread (at most 200 ms, or \a limit,
++    // then the caller checks again); lock held, and held again on return.
++    void WaitLocked(bigtime_t limit = 200000)
 +    {
 +        m_waiters++;
 +        m_lock.Unlock();
-+        acquire_sem_etc(m_dataSem, 1, B_RELATIVE_TIMEOUT, 200000);
++        acquire_sem_etc(m_dataSem, 1, B_RELATIVE_TIMEOUT,
++            std::clamp<bigtime_t>(limit, 1000, 200000));
 +        m_lock.Lock();
 +        m_waiters--;
 +    }
@@ -487,6 +557,7 @@ index f1590b7..de849c4 100644
 +    off_t m_totalSize { -1 };
 +    off_t m_wanted { -1 };
 +    off_t m_requestStart { -1 };
++    bigtime_t m_requestStartTime { 0 };
 +    off_t m_cursor { 0 };
 +    uint32 m_generation { 0 };
 +    int m_failures { 0 };
@@ -495,13 +566,15 @@ index f1590b7..de849c4 100644
 +    bool m_gotResponseForRequest { false };
 +    bool m_rangeSupported { true };
 +    bool m_failed { false };
++    bool m_readFailed { false };
++    bool m_interrupted { false };
 +    bool m_abort { false };
 +};
 +
  class MediaPlayerFactoryHaiku final : public MediaPlayerFactory {
  private:
      MediaPlayerEnums::MediaEngineIdentifier identifier() const final { return MediaPlayerEnums::MediaEngineIdentifier::Haiku; };
-@@ -121,6 +606,15 @@ void MediaPlayerPrivate::load(const String& url)
+@@ -121,6 +679,15 @@ void MediaPlayerPrivate::load(const String& url)
      m_abort = false;
      m_url = url;
  
@@ -517,7 +590,7 @@ index f1590b7..de849c4 100644
      m_loadingThread = spawn_thread(loadingThread, "media loader", B_NORMAL_PRIORITY, this);
      if (m_loadingThread >= 0)
          resume_thread(m_loadingThread);
-@@ -132,6 +626,10 @@ void MediaPlayerPrivate::load(const String& url)
+@@ -132,6 +699,10 @@ void MediaPlayerPrivate::load(const String& url)
  void MediaPlayerPrivate::cancelLoad()
  {
      m_abort = true;
@@ -528,7 +601,19 @@ index f1590b7..de849c4 100644
  
      // Do not hold the lock while waiting for threads, as they need it to finish
      if (m_loadingThread >= 0) {
-@@ -160,6 +658,9 @@ void MediaPlayerPrivate::cancelLoad()
+@@ -152,6 +723,11 @@ void MediaPlayerPrivate::cancelLoad()
+         m_audioThread = -1;
+     }
+ 
++    // Renga: seeks run on their own threads; with m_abort set they end
++    // without touching the tracks, and reads in them return B_CANCELED.
++    while (m_seekThreads.load() > 0)
++        snooze(5000);
++
+     m_mediaLock.Lock();
+     if (m_soundPlayer)
+         m_soundPlayer->Stop();
+@@ -160,6 +736,9 @@ void MediaPlayerPrivate::cancelLoad()
  
      delete m_mediaFile;
      m_mediaFile = nullptr;
@@ -538,7 +623,7 @@ index f1590b7..de849c4 100644
      m_audioTrack = nullptr;
      m_videoTrack = nullptr;
      m_videoEOF = false;
-@@ -171,6 +672,13 @@ void MediaPlayerPrivate::cancelLoad()
+@@ -171,6 +750,20 @@ void MediaPlayerPrivate::cancelLoad()
      m_framesPlayed = 0;
      m_audioEOF = false;
      m_endReported = false;
@@ -546,13 +631,20 @@ index f1590b7..de849c4 100644
 +    m_clockSpan = 0;
 +    m_clockStamp = 0;
 +    m_audioClockUsable = false;
++    m_videoFrameRate = 25;
 +    m_videoFrameDuration = 40000;
++    m_audioDuration = 0;
++    m_videoDuration = 0;
 +    m_videoBaseTime = 0;
 +    m_videoFramesRead = 0;
++    m_seekTime = 0;
++    m_seekPending = 0;
++    m_mediaError = false;
++    m_errorReported = false;
      m_mediaLock.Unlock();
  }
  
-@@ -210,11 +718,19 @@ void MediaPlayerPrivate::playCallback(void* cookie, void* buffer,
+@@ -210,11 +803,19 @@ void MediaPlayerPrivate::playCallback(void* cookie, void* buffer,
                  memcpy(out + first, player->m_ring.get(), copied - first);
              player->m_ringRead.store(read + copied, std::memory_order_release);
  
@@ -572,18 +664,22 @@ index f1590b7..de849c4 100644
              }
          }
          player->m_ringLock.Unlock();
-@@ -228,8 +744,16 @@ void MediaPlayerPrivate::playCallback(void* cookie, void* buffer,
+@@ -226,10 +827,18 @@ void MediaPlayerPrivate::playCallback(void* cookie, void* buffer,
+             ? 0x80 : 0, size - copied);
+     }
  
-     if (copied == 0 && player->m_audioEOF && player->AudioDrained()
-         && !player->m_endReported.exchange(true)) {
+-    if (copied == 0 && player->m_audioEOF && player->AudioDrained()
+-        && !player->m_endReported.exchange(true)) {
 -        if (player->m_audioTrack)
 -            player->m_currentTime = player->m_audioTrack->Duration() / 1000000.f;
++    if (copied == 0 && player->m_audioEOF && !player->m_mediaError
++        && player->AudioDrained() && !player->m_endReported.exchange(true)) {
 +        if (player->m_audioTrack) {
 +            // Renga: when the sound is the longer track (or the only one),
 +            // its end is the end: not below duration(), or the element
 +            // would not end. Otherwise the video thread runs on to it.
-+            bigtime_t audioDuration = player->m_audioTrack->Duration();
-+            if (!player->m_videoTrack || audioDuration >= player->m_videoTrack->Duration())
++            bigtime_t audioDuration = player->m_audioDuration;
++            if (!player->m_videoTrack || audioDuration >= player->m_videoDuration)
 +                player->m_currentTime = player->EndTime();
 +            else
 +                player->m_currentTime = audioDuration / 1000000.f;
@@ -591,7 +687,7 @@ index f1590b7..de849c4 100644
          player->m_soundPlayer->Stop(false);
  
          callOnMainThread([p = WeakPtr(player)] {
-@@ -247,6 +771,57 @@ bool MediaPlayerPrivate::AudioDrained() const
+@@ -247,6 +856,98 @@ bool MediaPlayerPrivate::AudioDrained() const
  }
  
  
@@ -627,7 +723,48 @@ index f1590b7..de849c4 100644
 +	track (see videoThread() for why start_time is not used). */
 +bigtime_t MediaPlayerPrivate::VideoFramePts()
 +{
-+    return m_videoBaseTime + m_videoFramesRead++ * m_videoFrameDuration;
++    // Rounded once per frame from the count, so it does not drift (a sum
++    // of whole microseconds per frame lost 72 ms an hour at 29.97 fps).
++    return m_videoBaseTime + std::llround(m_videoFramesRead++ * 1000000.0 / m_videoFrameRate);
++}
++
++
++/*!	Renga: a decoder's ReadFrames() failed. Every failure of the FFmpeg
++	reader comes back as B_LAST_BUFFER_ERROR, so the data source tells an
++	I/O error (a failed download, a read past its deadline) from the end
++	of the media. Returns true when the failure is not the end: a seek
++	interrupted the read (the seek resets the track), or an error, which
++	is reported once as a network error; the time does not run on to the
++	end then and "ended" is not fired.
++*/
++bool MediaPlayerPrivate::ReadFailed()
++{
++    if (m_seekPending.load() > 0 || m_abort)
++        return true;
++    if (!m_dataSource || !m_dataSource->HasFailed())
++        return false;
++
++    m_mediaError = true;
++    if (!m_errorReported.exchange(true)) {
++        callOnMainThread([p = WeakPtr(this)] {
++            if (!p)
++                return;
++            p->m_networkState = MediaPlayer::NetworkState::NetworkError;
++            p->m_player.networkStateChanged();
++        });
++    }
++    return true;
++}
++
++
++/*!	Renga: the video thread's clock writes m_currentTime only while no
++	seek has happened since it read the generation (a seek sets the time
++	and the generation together under m_timeLock). */
++void MediaPlayerPrivate::SetVideoClockTime(uint32_t generation, float time)
++{
++    BAutolock locker(m_timeLock);
++    if (generation == m_videoGeneration)
++        m_currentTime = time;
 +}
 +
 +
@@ -649,7 +786,7 @@ index f1590b7..de849c4 100644
  /*!	Called by IdentifyTracks() with the audio track's decoded format. */
  void MediaPlayerPrivate::SetUpAudio(const media_format& format)
  {
-@@ -294,6 +869,9 @@ void MediaPlayerPrivate::ResetAudio(bigtime_t mediaTime)
+@@ -294,6 +995,9 @@ void MediaPlayerPrivate::ResetAudio(bigtime_t mediaTime)
      m_audioStartTime = mediaTime;
      m_audioEOF = false;
      m_endReported = false;
@@ -659,7 +796,39 @@ index f1590b7..de849c4 100644
  }
  
  
-@@ -370,78 +948,163 @@ status_t MediaPlayerPrivate::loadingThread(void* cookie)
+@@ -305,7 +1009,8 @@ status_t MediaPlayerPrivate::audioThread(void* cookie)
+         uint64_t written = player->m_ringWritten.load(std::memory_order_relaxed);
+         uint64_t read = player->m_ringRead.load(std::memory_order_acquire);
+         size_t space = player->m_ringSize - (size_t)(written - read);
+-        if (player->m_audioEOF || space < player->m_chunkSize * 2) {
++        if (player->m_audioEOF || space < player->m_chunkSize * 2
++            || player->m_seekPending.load() > 0) {
+             snooze(5000);
+             continue;
+         }
+@@ -314,10 +1019,20 @@ status_t MediaPlayerPrivate::audioThread(void* cookie)
+         if (!player->m_audioTrack || player->m_abort)
+             break;
+ 
++        if (player->m_seekPending.load() > 0)
++            continue;
++
+         int64 frames = 0;
+         if (player->m_audioTrack->ReadFrames(player->m_chunk.get(), &frames) != B_OK
+             || frames <= 0) {
+-            player->m_audioEOF = true;
++            // Renga: the end, an error (no more decoding either way, but
++            // no "ended" after an error), or a seek (it resets the ring).
++            bool interrupted = player->m_seekPending.load() > 0;
++            if (!player->ReadFailed() || !interrupted)
++                player->m_audioEOF = true;
++            decode.Unlock();
++            if (interrupted)
++                snooze(5000);
+             continue;
+         }
+ 
+@@ -370,78 +1085,174 @@ status_t MediaPlayerPrivate::loadingThread(void* cookie)
  }
  
  /*!	Renga: decodes under m_videoDecodeLock only (the audio callback no longer
@@ -689,7 +858,10 @@ index f1590b7..de849c4 100644
 +	clip within seconds and its last frame stayed on screen. The count
 +	starts at the time the track was last seeked to (m_videoBaseTime, in
 +	microseconds from BMediaTrack::SeekToTime()) and adds one frame
-+	duration per frame read; this assumes a constant frame rate.
++	duration per frame read. This assumes a constant frame rate, frames
++	the decoder does not skip, a first frame at 0 and, after a seek, a
++	first frame at the time SeekToTime() gives; a correct start_time from
++	the plug-in would remove these limits.
  */
  status_t MediaPlayerPrivate::videoThread(void* cookie)
  {
@@ -714,7 +886,8 @@ index f1590b7..de849c4 100644
 +    bool endReported = false;
  
      while (!player->m_abort) {
-         if (player->m_paused) {
+-        if (player->m_paused) {
++        if (player->m_paused || player->m_seekPending.load() > 0) {
              snooze(10000);
              startTime = system_time();
              startMediaTime = (bigtime_t)(player->m_currentTime * 1000000);
@@ -730,8 +903,6 @@ index f1590b7..de849c4 100644
  
 -        bool useAudio = player->m_audioTrack && player->m_ringSize
 -            && !(player->m_audioEOF && player->AudioDrained());
--        if (useAudio != audioClock) {
--            audioClock = useAudio;
 +        uint32_t generation = player->m_videoGeneration;
 +        if (generation != seenGeneration) {
 +            // A seek: the held frame is stale, the clock starts again.
@@ -739,31 +910,34 @@ index f1590b7..de849c4 100644
 +            havePending = false;
 +            lastPresent = 0;
 +            endReported = false;
++            startTime = system_time();
++            // Published with the generation, unlike m_currentTime, which
++            // the sound may already have moved on.
++            startMediaTime = player->m_seekTime.load();
++        }
++
++        bool useAudio = player->m_audioClockUsable && player->m_audioTrack
++            && player->m_ringSize && !(player->m_audioEOF && player->AudioDrained());
+         if (useAudio != audioClock) {
+             audioClock = useAudio;
              startTime = system_time();
              startMediaTime = (bigtime_t)(player->m_currentTime * 1000000);
          }
  
 -        // Detect seek or external time update
 -        if (std::abs(player->m_currentTime - lastObservedTime) > 0.5f) {
-+        bool useAudio = player->m_audioClockUsable && player->m_audioTrack
-+            && player->m_ringSize && !(player->m_audioEOF && player->AudioDrained());
-+        if (useAudio != audioClock) {
-+            audioClock = useAudio;
-             startTime = system_time();
-             startMediaTime = (bigtime_t)(player->m_currentTime * 1000000);
-         }
- 
--        bigtime_t clockTime;
+-            startTime = system_time();
+-            startMediaTime = (bigtime_t)(player->m_currentTime * 1000000);
 +        if (!havePending) {
 +            if (player->m_videoEOF) {
 +                // Renga: with the system clock (no sound, or the sound has
 +                // ended), the time runs on to the end and the end is
 +                // reported once; it used to stand still at the last frame,
 +                // just short of duration(), and the element never ended.
-+                if (!audioClock && !endReported) {
++                if (!audioClock && !endReported && !player->m_mediaError) {
 +                    float end = player->EndTime();
 +                    float clock = (startMediaTime + (system_time() - startTime)) / 1000000.f;
-+                    player->m_currentTime = std::min(clock, end);
++                    player->SetVideoClockTime(generation, std::min(clock, end));
 +                    if (clock >= end) {
 +                        endReported = true;
 +                        callOnMainThread([p = WeakPtr(player)] {
@@ -784,7 +958,13 @@ index f1590b7..de849c4 100644
 +            bigtime_t before = system_time();
 +            if (player->m_videoTrack->ReadFrames(player->m_decodeBuffer->Bits(),
 +                    &count, &header) != B_OK) {
-+                player->m_videoEOF = true;
++                // Renga: the end, an error, or a seek (see ReadFailed()).
++                bool interrupted = player->m_seekPending.load() > 0;
++                if (!player->ReadFailed() || !interrupted)
++                    player->m_videoEOF = true;
++                decode.Unlock();
++                if (interrupted)
++                    snooze(5000);
 +                continue;
 +            }
 +            bigtime_t took = system_time() - before;
@@ -795,8 +975,9 @@ index f1590b7..de849c4 100644
 +            pendingPts = player->VideoFramePts();
 +            pendingGeneration = generation;
 +            havePending = true;
-+        }
-+
+         }
+ 
+-        bigtime_t clockTime;
 +        bigtime_t now = system_time();
 +        bigtime_t clock;
          if (audioClock)
@@ -806,11 +987,9 @@ index f1590b7..de849c4 100644
 -            clockTime = startMediaTime + (system_time() - startTime);
 -            player->m_currentTime = clockTime / 1000000.f;
 +            clock = startMediaTime + (now - startTime);
-+            player->m_currentTime = clock / 1000000.f;
-         }
--        lastObservedTime = player->m_currentTime;
- 
--        bool decoded = false;
++            player->SetVideoClockTime(generation, clock / 1000000.f);
++        }
++
 +        bigtime_t early = pendingPts - clock;
 +        if (early > 2000) {
 +            snooze(std::min(early, kMaxWait));
@@ -822,8 +1001,10 @@ index f1590b7..de849c4 100644
 +            // Its successor is due already: drop it and decode that.
 +            havePending = false;
 +            continue;
-+        }
-+
+         }
+-        lastObservedTime = player->m_currentTime;
+ 
+-        bool decoded = false;
 +        bool presented = false;
          {
              BAutolock decode(player->m_videoDecodeLock);
@@ -859,7 +1040,7 @@ index f1590b7..de849c4 100644
      }
  
      return B_OK;
-@@ -452,8 +1115,12 @@ status_t MediaPlayerPrivate::videoThread(void* cookie)
+@@ -452,8 +1263,12 @@ status_t MediaPlayerPrivate::videoThread(void* cookie)
  
  void MediaPlayerPrivate::play()
  {
@@ -873,7 +1054,22 @@ index f1590b7..de849c4 100644
      m_paused = false;
  }
  
-@@ -502,6 +1169,18 @@ WTF::MediaTime MediaPlayerPrivate::duration() const
+@@ -492,66 +1307,158 @@ WTF::MediaTime MediaPlayerPrivate::duration() const
+ {
+     // Renga: the longer of the two tracks, so a video without an audio
+     // track has a duration too (it reported none and did not advance).
+-    bigtime_t duration = 0;
+-    if (m_audioTrack)
+-        duration = m_audioTrack->Duration();
+-    if (m_videoTrack)
+-        duration = std::max(duration, m_videoTrack->Duration());
++    // Taken when the tracks were found: BMediaTrack::Duration() waits for
++    // the FFmpeg reader's stream lock, which a decoder thread holds while
++    // its read waits for the network, and this runs on the main thread
++    // (and in the sound player's callback).
++    bigtime_t duration = std::max(m_audioDuration.load(), m_videoDuration.load());
+     if (duration <= 0)
+         return WTF::MediaTime();
      return WTF::MediaTime::createWithDouble(duration / 1000000.0);
  }
  
@@ -892,20 +1088,115 @@ index f1590b7..de849c4 100644
  WTF::MediaTime MediaPlayerPrivate::currentTime() const
  {
      return WTF::MediaTime::createWithDouble(m_currentTime);
-@@ -522,7 +1201,12 @@ Ref<MediaTimePromise> MediaPlayerPrivate::seekToTarget(const SeekTarget& time)
-             m_videoTrack->SeekToTime(&videoTime);
+ }
+ 
++/*!	Renga: a seek runs on its own thread, so that the main thread never
++	waits for the network: the seek needs both decode locks, which the
++	decoder threads hold while they wait for data, and the track's
++	SeekToTime() reads at the new position, which may not be downloaded.
++	The decoder threads' reads are interrupted first (they see
++	m_seekPending and neither end nor fail), then the seek takes the locks;
++	its own reads wait at most the data source's deadline. The promise is
++	settled when it is done; a later seek makes an earlier one that has not
++	started yet give up (Cancelled), and cancelLoad() waits for them all.
++*/
++struct MediaPlayerPrivate::SeekJob {
++    MediaPlayerPrivate* player;
++    WeakPtr<MediaPlayerPrivate> weakPlayer;
++    bigtime_t target;
++    uint32_t serial;
++    MediaTimePromise::AutoRejectProducer producer { PlatformMediaError::Cancelled };
++};
++
++
+ Ref<MediaTimePromise> MediaPlayerPrivate::seekToTarget(const SeekTarget& time)
+ {
+-    m_mediaLock.Lock();
+-    bigtime_t target = (bigtime_t)(time.time.toDouble() * 1000000);
++    auto* job = new SeekJob { this, WeakPtr(this),
++        (bigtime_t)(time.time.toDouble() * 1000000), ++m_seekSerial };
++    Ref<MediaTimePromise> promise = job->producer.promise();
++
++    m_seekThreads++;
++    thread_id thread = spawn_thread(seekThread, "media seek", B_NORMAL_PRIORITY, job);
++    if (thread < 0 || resume_thread(thread) != B_OK) {
++        delete job;
++        m_seekThreads--;
++    }
++    return promise;
++}
++
++
++status_t MediaPlayerPrivate::seekThread(void* cookie)
++{
++    std::unique_ptr<SeekJob> job(static_cast<SeekJob*>(cookie));
++    MediaPlayerPrivate* player = job->player;
++    player->DoSeek(*job);
++    job.reset();
++    // Last: cancelLoad() may delete the player once this is 0.
++    player->m_seekThreads--;
++    return B_OK;
++}
++
++
++void MediaPlayerPrivate::DoSeek(SeekJob& job)
++{
++    BAutolock seeking(m_seekLock);
++    if (m_abort || job.serial != m_seekSerial.load())
++        return;
++
++    bigtime_t target = job.target;
+     bigtime_t newTime = target;
++    bool failed = false;
+     {
+-        // Renga: both decoders stop for the seek; the audio ring starts
+-        // again at the audio track's new position.
++        // The decoder threads leave their reads and stay out.
++        m_seekPending++;
++        if (m_dataSource)
++            m_dataSource->SetInterrupted(true);
+         BAutolock audio(m_audioDecodeLock);
+         BAutolock video(m_videoDecodeLock);
++        if (m_dataSource)
++            m_dataSource->SetInterrupted(false);
++
++        if (m_abort) {
++            m_seekPending--;
++            return;
++        }
++
++        // Both decoders stop for the seek; the audio ring starts again at
++        // the audio track's new position.
+         if (m_videoTrack) {
+             bigtime_t videoTime = target;
+-            m_videoTrack->SeekToTime(&videoTime);
++            failed |= m_videoTrack->SeekToTime(&videoTime) != B_OK;
              newTime = videoTime;
              m_videoEOF = false;
-+            // Renga: the video PTS count starts again here.
++            // The video PTS count starts again here.
 +            m_videoBaseTime = videoTime;
 +            m_videoFramesRead = 0;
          }
-+        // Renga: the video thread drops the frame it holds.
-+        m_videoGeneration++;
          if (m_audioTrack) {
              bigtime_t audioTime = target;
-             m_audioTrack->SeekToTime(&audioTime);
-@@ -537,14 +1221,12 @@ Ref<MediaTimePromise> MediaPlayerPrivate::seekToTarget(const SeekTarget& time)
+-            m_audioTrack->SeekToTime(&audioTime);
++            failed |= m_audioTrack->SeekToTime(&audioTime) != B_OK;
+             newTime = audioTime;
+             ResetAudio(audioTime);
+             if (m_soundPlayer && !m_paused)
+                 m_soundPlayer->Start();
+         }
+ 
+-        m_currentTime = newTime / 1000000.f;
++        {
++            // The time and the generation together (see SetVideoClockTime());
++            // the video thread drops the frame it holds.
++            BAutolock locker(m_timeLock);
++            m_seekTime = newTime;
++            m_currentTime = newTime / 1000000.f;
++            m_videoGeneration++;
++        }
+ 
          if (m_paused && m_videoTrack && m_decodeBuffer) {
              int64 count;
              if (m_videoTrack->ReadFrames(m_decodeBuffer->Bits(), &count) == B_OK) {
@@ -921,8 +1212,28 @@ index f1590b7..de849c4 100644
 +                PostRepaint();
              }
          }
++        m_seekPending--;
      }
-@@ -611,11 +1293,22 @@ void MediaPlayerPrivate::IdentifyTracks(const String& url)
+-    m_player.timeChanged();
+-    m_mediaLock.Unlock();
+-    // The promise was never returned (undefined behaviour).
+-    return MediaTimePromise::createAndResolve(WTF::MediaTime::createWithDouble(newTime / 1000000.0));
++
++    if (failed && m_dataSource && m_dataSource->HasFailed()) {
++        // A read for the seek timed out or the download failed.
++        ReadFailed();
++        return;
++    }
++
++    callOnMainThread([p = job.weakPlayer] {
++        if (p)
++            p->m_player.timeChanged();
++    });
++    job.producer.resolve(WTF::MediaTime::createWithDouble(newTime / 1000000.0));
+ }
+ 
+ 
+@@ -611,11 +1518,22 @@ void MediaPlayerPrivate::IdentifyTracks(const String& url)
      // TODO something here is blocking inside the Media Kit. We should rework
      // things so that this is run in a separate thread (Media Thread?). This
      // would avoid the annoying freeze whenever a media is being loaded.
@@ -947,17 +1258,42 @@ index f1590b7..de849c4 100644
  
      if (m_mediaFile->InitCheck() == B_OK) {
          for (int i = m_mediaFile->CountTracks() - 1; i >= 0; i--)
-@@ -636,6 +1329,9 @@ void MediaPlayerPrivate::IdentifyTracks(const String& url)
+@@ -629,6 +1547,7 @@ void MediaPlayerPrivate::IdentifyTracks(const String& url)
+                 if (m_videoTrack)
+                     continue;
+                 m_videoTrack = track;
++                m_videoDuration = track->Duration();
+ 
+                 m_frameBuffer = new BBitmap(
+                     BRect(0, 0, format.Width() - 1, format.Height() - 1),
+@@ -636,6 +1555,20 @@ void MediaPlayerPrivate::IdentifyTracks(const String& url)
                  m_decodeBuffer = new BBitmap(
                      BRect(0, 0, format.Width() - 1, format.Height() - 1),
                      B_RGB32);
-+                // Renga: for the drop threshold and missing PTS only.
-+                if (format.u.raw_video.field_rate > 1)
-+                    m_videoFrameDuration = (bigtime_t)(1000000 / format.u.raw_video.field_rate);
++                // Renga: the frame rate counts the video PTS (see
++                // videoThread()) and sets the drop threshold. The
++                // decoder's field rate if it is sane, else the track's
++                // frames over its duration, else 25 fps.
++                double rate = format.u.raw_video.field_rate;
++                if (!(rate >= 1 && rate <= 240)) {
++                    int64 frames = track->CountFrames();
++                    bigtime_t duration = track->Duration();
++                    rate = frames > 0 && duration > 0 ? frames * 1000000.0 / duration : 0;
++                    if (!(rate >= 1 && rate <= 240))
++                        rate = 25;
++                }
++                m_videoFrameRate = rate;
++                m_videoFrameDuration = std::llround(1000000.0 / rate);
  
                  if (m_audioTrack)
                      break;
-@@ -650,8 +1346,13 @@ void MediaPlayerPrivate::IdentifyTracks(const String& url)
+@@ -645,13 +1578,19 @@ void MediaPlayerPrivate::IdentifyTracks(const String& url)
+                 if (m_audioTrack)
+                     continue;
+                 m_audioTrack = track;
++                m_audioDuration = track->Duration();
+                 SetUpAudio(format);
+ 
                  m_soundPlayer = new BSoundPlayer(&format.u.raw_audio,
                      "HTML5 Audio", playCallback, NULL, this);
                  m_soundPlayer->SetVolume(m_volume);
@@ -973,7 +1309,7 @@ index f1590b7..de849c4 100644
                  if (m_videoTrack && m_audioTrack)
                      break;
 diff --git a/Source/WebCore/platform/graphics/haiku/MediaPlayerPrivateHaiku.h b/Source/WebCore/platform/graphics/haiku/MediaPlayerPrivateHaiku.h
-index 6dfcb8b..23c38d7 100644
+index 6dfcb8b..e877ca0 100644
 --- a/Source/WebCore/platform/graphics/haiku/MediaPlayerPrivateHaiku.h
 +++ b/Source/WebCore/platform/graphics/haiku/MediaPlayerPrivateHaiku.h
 @@ -44,6 +44,8 @@ struct media_raw_audio_format;
@@ -994,7 +1330,7 @@ index 6dfcb8b..23c38d7 100644
  
          PlatformTimeRanges& buffered() const override;
          bool didLoadingProgress() const override;
-@@ -113,6 +115,13 @@ private:
+@@ -113,6 +115,20 @@ private:
          void SetUpAudio(const media_format&);
          void ResetAudio(bigtime_t mediaTime);
          bool AudioDrained() const;
@@ -1005,10 +1341,26 @@ index 6dfcb8b..23c38d7 100644
 +        bigtime_t VideoFramePts();
 +        // Renga: duration() rounded up to a float, for the end.
 +        float EndTime() const;
++        // Renga: a decoder read failed: true unless it is the end.
++        bool ReadFailed();
++        void SetVideoClockTime(uint32_t generation, float time);
++        // Renga: seeks run on their own threads.
++        struct SeekJob;
++        static status_t seekThread(void*);
++        void DoSeek(SeekJob&);
  
  
          static void playCallback(void*, void*, size_t,
-@@ -159,6 +168,35 @@ private:
+@@ -139,7 +155,7 @@ private:
+         // m_decodeBuffer and swapped in.
+         BLocker m_frameLock { "html5 frame" };
+         BBitmap* m_decodeBuffer { nullptr };
+-        bool m_videoEOF { false };
++        std::atomic<bool> m_videoEOF { false };
+ 
+         // Decoded audio: one writer (audioThread), one reader (playCallback).
+         // m_ringLock is held only to copy or reset, never while decoding.
+@@ -159,6 +175,55 @@ private:
          std::atomic<bool> m_endReported { false };
          thread_id m_audioThread { -1 };
  
@@ -1024,6 +1376,10 @@ index 6dfcb8b..23c38d7 100644
 +
 +        // Renga: video presentation by PTS. A seek bumps the generation so
 +        // that the video thread drops the frame it holds.
++        double m_videoFrameRate { 25 };
++        // Renga: the tracks' durations, taken when they were found.
++        std::atomic<bigtime_t> m_audioDuration { 0 };
++        std::atomic<bigtime_t> m_videoDuration { 0 };
 +        bigtime_t m_videoFrameDuration { 40000 };
 +        // Renga: video PTS by count (start_time is in the stream's time
 +        // base): the track's time at the last seek and the frames read
@@ -1040,6 +1396,22 @@ index 6dfcb8b..23c38d7 100644
 +        // Renga: the media is read through m_dataSource, which can seek
 +        // ahead of the download: the whole duration is seekable.
 +        std::atomic<bool> m_seekAhead { false };
++
++        // Renga: seeks (see DoSeek()). m_seekLock runs one at a time; while
++        // m_seekPending the decoder threads do not read. m_timeLock pairs
++        // m_currentTime with m_videoGeneration; m_seekTime is the time the
++        // last seek set, for the video thread's clock.
++        BLocker m_seekLock { "html5 media seek" };
++        BLocker m_timeLock { "html5 media time" };
++        std::atomic<bigtime_t> m_seekTime { 0 };
++        std::atomic<int32_t> m_seekPending { 0 };
++        std::atomic<uint32_t> m_seekSerial { 0 };
++        std::atomic<int32_t> m_seekThreads { 0 };
++
++        // Renga: a read failed for good (not the end): reported once as a
++        // network error; no "ended" after it.
++        std::atomic<bool> m_mediaError { false };
++        std::atomic<bool> m_errorReported { false };
 +
          MediaPlayer& m_player;
          MediaPlayer::NetworkState m_networkState;
